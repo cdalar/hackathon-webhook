@@ -61,6 +61,26 @@ go run .
 `GET /healthz` returns `ok`. The service must be reachable from Azure DevOps over
 HTTPS — deploy it behind TLS, or use a tunnel while developing.
 
+## Docker
+
+```sh
+docker build -t hackathon-webhook .
+
+docker run -d --name hackathon-webhook -p 8080:8080 \
+  -e AZDO_ORG_URL -e AZDO_PAT -e AI_REVIEWER_ID \
+  -e ANTHROPIC_API_KEY -e WEBHOOK_SECRET \
+  hackathon-webhook
+```
+
+`-e NAME` with no value passes the variable through from your shell, which keeps
+secrets out of the command line and shell history; `--env-file .env` works too
+(`.env` is git- and docker-ignored). The image is a static binary on distroless:
+about 20 MB, runs as a non-root user, and has no shell. It listens on `:8080`
+and serves plain HTTP, so put it behind something that terminates TLS (a cloud
+load balancer, Caddy, a tunnel). Use `/healthz` for health checks. On `SIGTERM`
+it stops accepting deliveries and waits for in-flight reviews to finish, so give
+it a generous stop timeout (`docker stop -t 600`).
+
 ## Azure DevOps service hook
 
 Project settings → Service hooks → **+** → Web Hooks:

@@ -1,0 +1,37 @@
+name: docker
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  run:
+    name: Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t hackathon-webhook:ci .
+
+      - name: Smoke test
+        run: |
+          docker run -d --name smoke -p 8080:8080 \
+            -e AZDO_ORG_URL=https://dev.azure.com/example \
+            -e AZDO_PAT=dummy -e AI_REVIEWER_ID=dummy \
+            hackathon-webhook:ci
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:8080/healthz && exit 0
+            sleep 0.5
+          done
+          docker logs smoke
+          exit 1

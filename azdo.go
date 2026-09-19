@@ -83,11 +83,17 @@ func (c *azdoClient) do(ctx context.Context, method, url, accept string, body an
 	if err != nil {
 		return nil, err
 	}
-	// An invalid PAT gets a 203 with an HTML sign-in page, so only 200/201 count.
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("%s %s: %s: %.200s", method, req.URL.Path, resp.Status, data)
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated:
+		return data, nil
+	case http.StatusNonAuthoritativeInfo, http.StatusUnauthorized:
+		// An invalid or expired PAT gets a 203 with an HTML sign-in page.
+		return nil, fmt.Errorf("%s %s: %s: Azure DevOps rejected the credentials; check AZDO_PAT and its scopes",
+			method, req.URL.Path, resp.Status)
+	default:
+		return nil, fmt.Errorf("%s %s: %s: %.200s", method, req.URL.Path, resp.Status,
+			strings.Join(strings.Fields(string(data)), " "))
 	}
-	return data, nil
 }
 
 func (c *azdoClient) getJSON(ctx context.Context, url string, out any) error {

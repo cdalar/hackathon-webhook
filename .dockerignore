@@ -1,0 +1,8 @@
+.git
+.github
+.env
+.env.*
+*.md
+testdata
+*_test.go
+hackathon-webhook
