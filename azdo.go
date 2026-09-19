@@ -17,17 +17,18 @@ import (
 const (
 	apiVersion = "7.1"
 
-	// Limits on what is sent for review. Anything over them is reported in
-	// prDiff.Omitted rather than silently dropped.
+	// Limits on what is sent to the AI. Anything over them is reported in
+	// prDiff.Omitted rather than silently dropped. The diff budget is sized
+	// for a local model: roughly 40K tokens.
 	maxChangedFiles = 100
 	maxFileBytes    = 256 << 10
-	maxDiffBytes    = 600 << 10
+	maxDiffBytes    = 128 << 10
 )
 
-// prDiff is the reviewable content of a pull request.
+// prDiff is the textual content of a pull request's changes.
 type prDiff struct {
-	Text    string   // unified diff of all reviewed files
-	Omitted []string // "path (reason)" for every change left out of Text
+	Text    string   // unified diff of all included files
+	Omitted []string // "path (change type, reason)" for every change left out of Text
 }
 
 // azdoClient talks to the Azure DevOps Git REST API with a personal access
@@ -147,7 +148,7 @@ func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
 			continue
 		}
 		if text.Len() > maxDiffBytes {
-			diff.Omitted = append(diff.Omitted, item.Path+" (pull request too large)")
+			diff.Omitted = append(diff.Omitted, fmt.Sprintf("%s (%s, pull request too large)", item.Path, ch.ChangeType))
 			continue
 		}
 		before, reason, err := c.blobText(ctx, pr, item.OriginalObjectID)
@@ -162,7 +163,7 @@ func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
 			}
 		}
 		if reason != "" {
-			diff.Omitted = append(diff.Omitted, fmt.Sprintf("%s (%s)", item.Path, reason))
+			diff.Omitted = append(diff.Omitted, fmt.Sprintf("%s (%s, %s)", item.Path, ch.ChangeType, reason))
 			continue
 		}
 		fromPath := item.Path
@@ -190,7 +191,7 @@ func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
 
 // blobText returns a blob's content. An empty id (the missing side of an add
 // or delete) yields empty content. A non-empty reason means the blob is not
-// reviewable as text.
+// usable as text.
 func (c *azdoClient) blobText(ctx context.Context, pr pullRequest, id string) (content, reason string, err error) {
 	if id == "" {
 		return "", "", nil
@@ -208,6 +209,13 @@ func (c *azdoClient) blobText(ctx context.Context, pr pullRequest, id string) (c
 		return "", "binary file", nil
 	}
 	return string(data), "", nil
+}
+
+// UpdatePR replaces the pull request's title and description.
+func (c *azdoClient) UpdatePR(ctx context.Context, pr pullRequest, title, description string) error {
+	_, err := c.do(ctx, http.MethodPatch, c.repoURL(pr, fmt.Sprintf("pullrequests/%d", pr.ID), nil),
+		"application/json", map[string]string{"title": title, "description": description})
+	return err
 }
 
 // PostComment adds a new active comment thread to the pull request.

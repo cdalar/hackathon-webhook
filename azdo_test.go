@@ -31,6 +31,12 @@ func fakeAzdo(t *testing.T, posted *map[string]any) *httptest.Server {
 	mux.HandleFunc("GET "+repo+"/blobs/{id}", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, blobs[r.PathValue("id")])
 	})
+	mux.HandleFunc("PATCH "+repo+"/pullrequests/7", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(posted); err != nil {
+			t.Error(err)
+		}
+		fmt.Fprint(w, `{"pullRequestId":7}`)
+	})
 	mux.HandleFunc("POST "+repo+"/pullRequests/7/threads", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(posted); err != nil {
 			t.Error(err)
@@ -71,7 +77,7 @@ func TestDiff(t *testing.T) {
 			t.Errorf("diff missing %q:\n%s", want, diff.Text)
 		}
 	}
-	if len(diff.Omitted) != 1 || diff.Omitted[0] != "/logo.png (binary file)" {
+	if len(diff.Omitted) != 1 || diff.Omitted[0] != "/logo.png (add, binary file)" {
 		t.Errorf("Omitted = %q, want the binary logo", diff.Omitted)
 	}
 }
@@ -87,6 +93,19 @@ func TestPostComment(t *testing.T) {
 	comments, _ := posted["comments"].([]any)
 	if len(comments) != 1 || comments[0].(map[string]any)["content"] != "**review**" {
 		t.Errorf("posted thread = %v", posted)
+	}
+}
+
+func TestUpdatePR(t *testing.T) {
+	var sent map[string]any
+	srv := fakeAzdo(t, &sent)
+	defer srv.Close()
+
+	if err := newAzdoClient(srv.URL, "test-pat").UpdatePR(context.Background(), testPR(t), "New title", "New description"); err != nil {
+		t.Fatal(err)
+	}
+	if sent["title"] != "New title" || sent["description"] != "New description" || len(sent) != 2 {
+		t.Errorf("PATCH body = %v, want only the new title and description", sent)
 	}
 }
 

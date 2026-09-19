@@ -29,6 +29,7 @@ jobs:
           docker run -d --name smoke -p 8080:8080 \
             -e AZDO_ORG_URL=https://dev.azure.com/example \
             -e AZDO_PAT=dummy -e AI_REVIEWER_ID=dummy \
+            -e AI_BASE_URL=http://ai.invalid/v1 \
             hackathon-webhook:ci
           for i in $(seq 1 20); do
             curl -fsS http://127.0.0.1:8080/healthz && exit 0

@@ -1,6 +1,6 @@
 // Command hackathon-webhook receives Azure DevOps pull request webhooks and, when
-// the AI Assistant group is on the reviewer list, asks Claude to review the
-// pull request and posts the result back as a PR comment.
+// the AI Assistant group is on the reviewer list, asks an AI model to rewrite
+// the pull request's title and description from its changes.
 package main
 
 import (
@@ -22,6 +22,10 @@ type config struct {
 	pat           string
 	aiReviewerID  string
 	webhookSecret string
+	mode          string
+	aiBaseURL     string
+	aiModel       string
+	aiAPIKey      string
 }
 
 func loadConfig() (config, error) {
@@ -31,12 +35,17 @@ func loadConfig() (config, error) {
 		pat:           os.Getenv("AZDO_PAT"),
 		aiReviewerID:  os.Getenv("AI_REVIEWER_ID"),
 		webhookSecret: os.Getenv("WEBHOOK_SECRET"),
+		mode:          envOr("ENHANCE_MODE", modeUpdate),
+		aiBaseURL:     os.Getenv("AI_BASE_URL"),
+		aiModel:       os.Getenv("AI_MODEL"),
+		aiAPIKey:      os.Getenv("AI_API_KEY"),
 	}
 	var missing []string
 	for _, required := range [][2]string{
 		{"AZDO_ORG_URL", cfg.orgURL},
 		{"AZDO_PAT", cfg.pat},
 		{"AI_REVIEWER_ID", cfg.aiReviewerID},
+		{"AI_BASE_URL", cfg.aiBaseURL},
 	} {
 		if required[1] == "" {
 			missing = append(missing, required[0])
@@ -44,6 +53,9 @@ func loadConfig() (config, error) {
 	}
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+	}
+	if cfg.mode != modeUpdate && cfg.mode != modeSuggest {
+		return cfg, fmt.Errorf("ENHANCE_MODE must be %q or %q, not %q", modeUpdate, modeSuggest, cfg.mode)
 	}
 	return cfg, nil
 }
@@ -61,14 +73,15 @@ func main() {
 		log.Fatal(err)
 	}
 	if cfg.webhookSecret == "" {
-		log.Print("WARNING: WEBHOOK_SECRET is not set; anyone who can reach /webhook can trigger reviews")
+		log.Print("WARNING: WEBHOOK_SECRET is not set; anyone who can reach /webhook can trigger enhancements")
 	}
 
 	handler := &webhookHandler{
 		aiReviewerID: cfg.aiReviewerID,
 		secret:       cfg.webhookSecret,
+		mode:         cfg.mode,
 		prs:          newAzdoClient(cfg.orgURL, cfg.pat),
-		reviewer:     newClaudeReviewer(),
+		enhancer:     newOpenAIEnhancer(cfg.aiBaseURL, cfg.aiModel, cfg.aiAPIKey),
 	}
 
 	mux := http.NewServeMux()
@@ -90,10 +103,10 @@ func main() {
 		}
 	}()
 
-	log.Printf("listening on %s (AI reviewer %s)", cfg.addr, cfg.aiReviewerID)
+	log.Printf("listening on %s (AI reviewer %s, AI server %s, %s mode)", cfg.addr, cfg.aiReviewerID, cfg.aiBaseURL, cfg.mode)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
-	log.Print("waiting for in-flight reviews to finish")
+	log.Print("waiting for in-flight enhancements to finish")
 	handler.wait()
 }
