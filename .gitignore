@@ -1,0 +1,9 @@
+# Binaries
+/hackathon-webhook
+*.exe
+*.test
+*.out
+
+# Local configuration and secrets
+.env
+.env.*

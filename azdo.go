@@ -1,0 +1,220 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/pmezard/go-difflib/difflib"
+)
+
+const (
+	apiVersion = "7.1"
+
+	// Limits on what is sent for review. Anything over them is reported in
+	// prDiff.Omitted rather than silently dropped.
+	maxChangedFiles = 100
+	maxFileBytes    = 256 << 10
+	maxDiffBytes    = 600 << 10
+)
+
+// prDiff is the reviewable content of a pull request.
+type prDiff struct {
+	Text    string   // unified diff of all reviewed files
+	Omitted []string // "path (reason)" for every change left out of Text
+}
+
+// azdoClient talks to the Azure DevOps Git REST API with a personal access
+// token. Requests only ever go to the configured organization URL, never to a
+// URL taken from a webhook payload.
+type azdoClient struct {
+	orgURL string
+	auth   string
+	http   *http.Client
+}
+
+func newAzdoClient(orgURL, pat string) *azdoClient {
+	return &azdoClient{
+		orgURL: orgURL,
+		auth:   "Basic " + base64.StdEncoding.EncodeToString([]byte(":"+pat)),
+		http:   &http.Client{},
+	}
+}
+
+func (c *azdoClient) repoURL(pr pullRequest, path string, query url.Values) string {
+	if query == nil {
+		query = url.Values{}
+	}
+	query.Set("api-version", apiVersion)
+	return fmt.Sprintf("%s/%s/_apis/git/repositories/%s/%s?%s", c.orgURL,
+		url.PathEscape(pr.Repository.Project.ID), url.PathEscape(pr.Repository.ID), path, query.Encode())
+}
+
+func (c *azdoClient) do(ctx context.Context, method, url, accept string, body any) ([]byte, error) {
+	var reqBody io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reqBody = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", c.auth)
+	req.Header.Set("Accept", accept)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	// An invalid PAT gets a 203 with an HTML sign-in page, so only 200/201 count.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("%s %s: %s: %.200s", method, req.URL.Path, resp.Status, data)
+	}
+	return data, nil
+}
+
+func (c *azdoClient) getJSON(ctx context.Context, url string, out any) error {
+	data, err := c.do(ctx, http.MethodGet, url, "application/json", nil)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, out)
+}
+
+// Diff builds a unified diff of the pull request's latest iteration against
+// the commit it branched from.
+func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
+	var iterations struct {
+		Value []struct {
+			ID int `json:"id"`
+		} `json:"value"`
+	}
+	if err := c.getJSON(ctx, c.repoURL(pr, fmt.Sprintf("pullRequests/%d/iterations", pr.ID), nil), &iterations); err != nil {
+		return prDiff{}, err
+	}
+	if len(iterations.Value) == 0 {
+		return prDiff{}, fmt.Errorf("pull request %d has no iterations", pr.ID)
+	}
+	latest := iterations.Value[len(iterations.Value)-1].ID
+
+	var changes struct {
+		ChangeEntries []struct {
+			ChangeType string `json:"changeType"`
+			Item       struct {
+				Path             string `json:"path"`
+				ObjectID         string `json:"objectId"`
+				OriginalObjectID string `json:"originalObjectId"`
+				IsFolder         bool   `json:"isFolder"`
+			} `json:"item"`
+			OriginalPath string `json:"originalPath"`
+		} `json:"changeEntries"`
+		NextTop int `json:"nextTop"`
+	}
+	changesURL := c.repoURL(pr, fmt.Sprintf("pullRequests/%d/iterations/%d/changes", pr.ID, latest),
+		url.Values{"$top": {fmt.Sprint(maxChangedFiles)}})
+	if err := c.getJSON(ctx, changesURL, &changes); err != nil {
+		return prDiff{}, err
+	}
+
+	var diff prDiff
+	var text strings.Builder
+	for _, ch := range changes.ChangeEntries {
+		item := ch.Item
+		if item.IsFolder {
+			continue
+		}
+		if text.Len() > maxDiffBytes {
+			diff.Omitted = append(diff.Omitted, item.Path+" (pull request too large)")
+			continue
+		}
+		before, reason, err := c.blobText(ctx, pr, item.OriginalObjectID)
+		if err != nil {
+			return prDiff{}, err
+		}
+		var after string
+		if reason == "" {
+			after, reason, err = c.blobText(ctx, pr, item.ObjectID)
+			if err != nil {
+				return prDiff{}, err
+			}
+		}
+		if reason != "" {
+			diff.Omitted = append(diff.Omitted, fmt.Sprintf("%s (%s)", item.Path, reason))
+			continue
+		}
+		fromPath := item.Path
+		if ch.OriginalPath != "" {
+			fromPath = ch.OriginalPath
+		}
+		fileDiff, err := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+			A:        difflib.SplitLines(before),
+			B:        difflib.SplitLines(after),
+			FromFile: "a" + fromPath,
+			ToFile:   "b" + item.Path,
+			Context:  5,
+		})
+		if err != nil {
+			return prDiff{}, err
+		}
+		fmt.Fprintf(&text, "# %s: %s\n%s\n", ch.ChangeType, item.Path, fileDiff)
+	}
+	if changes.NextTop > 0 {
+		diff.Omitted = append(diff.Omitted, fmt.Sprintf("changes beyond the first %d files", maxChangedFiles))
+	}
+	diff.Text = text.String()
+	return diff, nil
+}
+
+// blobText returns a blob's content. An empty id (the missing side of an add
+// or delete) yields empty content. A non-empty reason means the blob is not
+// reviewable as text.
+func (c *azdoClient) blobText(ctx context.Context, pr pullRequest, id string) (content, reason string, err error) {
+	if id == "" {
+		return "", "", nil
+	}
+	data, err := c.do(ctx, http.MethodGet,
+		c.repoURL(pr, "blobs/"+url.PathEscape(id), url.Values{"$format": {"octetstream"}}),
+		"application/octet-stream", nil)
+	if err != nil {
+		return "", "", err
+	}
+	switch {
+	case len(data) > maxFileBytes:
+		return "", "file too large", nil
+	case bytes.IndexByte(data, 0) >= 0:
+		return "", "binary file", nil
+	}
+	return string(data), "", nil
+}
+
+// PostComment adds a new active comment thread to the pull request.
+func (c *azdoClient) PostComment(ctx context.Context, pr pullRequest, markdown string) error {
+	thread := map[string]any{
+		"status": 1, // active
+		"comments": []map[string]any{{
+			"parentCommentId": 0,
+			"commentType":     1, // text
+			"content":         markdown,
+		}},
+	}
+	_, err := c.do(ctx, http.MethodPost, c.repoURL(pr, fmt.Sprintf("pullRequests/%d/threads", pr.ID), nil),
+		"application/json", thread)
+	return err
+}
