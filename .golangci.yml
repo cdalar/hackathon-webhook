@@ -1,0 +1,11 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        # A failed write to an HTTP response means the client went away;
+        # there is nothing useful to do with the error.
+        - fmt.Fprint(net/http.ResponseWriter)
+        - fmt.Fprintf(net/http.ResponseWriter)
+        - fmt.Fprintln(net/http.ResponseWriter)

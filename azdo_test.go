@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,7 +29,7 @@ func fakeAzdo(t *testing.T, posted *map[string]any) *httptest.Server {
 			{"changeType":"add","item":{"path":"/logo.png","objectId":"new-logo"}}]}`)
 	})
 	mux.HandleFunc("GET "+repo+"/blobs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, blobs[r.PathValue("id")])
+		fmt.Fprint(w, blobs[r.PathValue("id")])
 	})
 	mux.HandleFunc("POST "+repo+"/pullRequests/7/threads", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(posted); err != nil {
