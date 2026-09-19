@@ -63,14 +63,19 @@ HTTPS — deploy it behind TLS, or use a tunnel while developing.
 
 ## Docker
 
-```sh
-docker build -t hackathon-webhook .
+Every push to `main` publishes a multi-arch (amd64 + arm64) image to the GitHub
+Container Registry, tagged `latest` and `sha-<commit>`; `v*` git tags also
+publish `<version>` and `<major>.<minor>`.
 
+```sh
 docker run -d --name hackathon-webhook -p 8080:8080 \
   -e AZDO_ORG_URL -e AZDO_PAT -e AI_REVIEWER_ID \
   -e ANTHROPIC_API_KEY -e WEBHOOK_SECRET \
-  hackathon-webhook
+  ghcr.io/cdalar/hackathon-webhook:latest
 ```
+
+For deployments, pin a `sha-<commit>` or version tag rather than `latest`. To
+build locally instead: `docker build -t hackathon-webhook .`
 
 `-e NAME` with no value passes the variable through from your shell, which keeps
 secrets out of the command line and shell history; `--env-file .env` works too
