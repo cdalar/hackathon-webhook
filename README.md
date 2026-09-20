@@ -115,13 +115,34 @@ For deployments, pin a `sha-<commit>` or version tag rather than `latest`. To
 build locally instead: `docker build -t hackathon-webhook .`
 
 `-e NAME` with no value passes the variable through from your shell, which keeps
-secrets out of the command line and shell history; `--env-file .env` works too
-(`.env` is git- and docker-ignored). The image is a static binary on distroless:
+secrets out of the command line and shell history. Or copy `.env.example` to
+`.env`, fill it in, and use `--env-file .env` (`.env` is git- and
+docker-ignored). The image is a static binary on distroless:
 about 20 MB, runs as a non-root user, and has no shell. It listens on `:8080`
 and serves plain HTTP, so put it behind something that terminates TLS (a cloud
 load balancer, Caddy, a tunnel). Use `/healthz` for health checks. On `SIGTERM`
 it stops accepting deliveries and waits for in-flight enhancements to finish, so give
 it a generous stop timeout (`docker stop -t 600`).
+
+## Try it without a service hook
+
+`scripts/emulate-delivery.sh` fetches a pull request's current state and POSTs
+it to a running receiver exactly as the service hook would, so you can test the
+whole flow before exposing anything to the internet. It needs `curl`, `jq`, and
+a filled-in `.env`.
+
+```sh
+cp .env.example .env    # then fill in .env
+docker run -d --name hackathon-webhook -p 127.0.0.1:8081:8080 --env-file .env \
+  ghcr.io/cdalar/hackathon-webhook:latest
+
+scripts/emulate-delivery.sh 42      # 42 = pull request ID; expect "HTTP 202"
+docker logs -f hackathon-webhook    # expect "PR 42: enhanced (update mode)"
+```
+
+The AI Assistant group must already be a reviewer on that PR. A PR that has been
+enhanced is skipped from then on; to run again, delete the footer from its
+description, or set `ENHANCE_MODE=suggest` to only ever comment.
 
 ## Azure DevOps service hook
 
