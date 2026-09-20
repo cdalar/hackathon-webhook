@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/pmezard/go-difflib/difflib"
 )
@@ -40,6 +41,20 @@ type fileChange struct {
 	ChangeTrackingID int          // ties a comment to this change across iterations
 	Numbered         string       // diff with the new file's line number on each line
 	Lines            map[int]bool // new-file line numbers that appear in Numbered
+	After            []string     // the new file's lines, without newlines; After[0] is line 1
+}
+
+// hasLines reports whether every line from first to last appears in the diff.
+func (f fileChange) hasLines(first, last int) bool {
+	if first < 1 || last < first {
+		return false
+	}
+	for line := first; line <= last; line++ {
+		if !f.Lines[line] {
+			return false
+		}
+	}
+	return true
 }
 
 // azdoClient talks to the Azure DevOps Git REST API with a personal access
@@ -201,6 +216,7 @@ func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
 			ChangeTrackingID: ch.ChangeTrackingID,
 			Numbered:         numbered,
 			Lines:            lines,
+			After:            strings.Split(strings.TrimSuffix(after, "\n"), "\n"),
 		})
 	}
 	if changes.NextTop > 0 {
@@ -307,14 +323,20 @@ func (c *azdoClient) PostComment(ctx context.Context, pr pullRequest, status thr
 	return c.postThread(ctx, pr, status, markdown, nil)
 }
 
-// PostFileComment adds an active comment thread on a changed file. A line that is in
-// file.Lines anchors the thread to that line of the new file; any other line
-// number makes it a comment on the file as a whole.
-func (c *azdoClient) PostFileComment(ctx context.Context, pr pullRequest, iteration int, file fileChange, line int, markdown string) error {
+// PostFileComment adds an active comment thread on a changed file. Lines that
+// are all in the diff anchor the thread to those whole lines of the new file,
+// which is also the range a suggestion in the comment replaces; any other
+// range makes it a comment on the file as a whole.
+func (c *azdoClient) PostFileComment(ctx context.Context, pr pullRequest, iteration int, file fileChange, firstLine, lastLine int, markdown string) error {
 	threadContext := map[string]any{"filePath": file.Path}
-	if file.Lines[line] {
-		position := map[string]int{"line": line, "offset": 1}
-		threadContext["rightFileStart"], threadContext["rightFileEnd"] = position, position
+	if file.hasLines(firstLine, lastLine) {
+		// Offsets count UTF-16 code units from 1; end just past the last one.
+		endOffset := 1
+		if lastLine <= len(file.After) {
+			endOffset = len(utf16.Encode([]rune(file.After[lastLine-1]))) + 1
+		}
+		threadContext["rightFileStart"] = map[string]int{"line": firstLine, "offset": 1}
+		threadContext["rightFileEnd"] = map[string]int{"line": lastLine, "offset": endOffset}
 	}
 	return c.postThread(ctx, pr, threadActive, markdown, map[string]any{
 		"threadContext": threadContext,

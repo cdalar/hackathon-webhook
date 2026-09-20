@@ -80,7 +80,8 @@ func TestDiff(t *testing.T) {
 	if diff.Iteration != 2 || len(diff.Files) != 1 {
 		t.Fatalf("Iteration = %d, Files = %+v, want iteration 2 and only the README", diff.Iteration, diff.Files)
 	}
-	if f := diff.Files[0]; f.Path != "/README.md" || f.ChangeTrackingID != 5 || !f.Lines[2] || !strings.Contains(f.Numbered, "    2 + Hello!") {
+	if f := diff.Files[0]; f.Path != "/README.md" || f.ChangeTrackingID != 5 || !f.Lines[2] || !strings.Contains(f.Numbered, "    2 + Hello!") ||
+		len(f.After) != 2 || f.After[1] != "Hello!" {
 		t.Errorf("Files[0] = %+v", f)
 	}
 	if len(diff.Omitted) != 1 || diff.Omitted[0] != "/logo.png (add, binary file)" {
@@ -119,14 +120,20 @@ func TestUpdatePR(t *testing.T) {
 }
 
 func TestPostFileComment(t *testing.T) {
-	file := fileChange{Path: "/README.md", ChangeTrackingID: 7, Lines: map[int]bool{2: true}}
+	file := fileChange{
+		Path: "/README.md", ChangeTrackingID: 7,
+		Lines: map[int]bool{2: true, 3: true}, After: []string{"# Demo", "Hello!", "héllo 🌍"},
+	}
 	tests := map[string]struct {
-		line     int
-		wantLine bool
+		line, lastLine int
+		wantLine       bool
+		wantEndOffset  float64
 	}{
-		"line in the diff anchors the thread":     {2, true},
-		"unknown line comments on the whole file": {99, false},
-		"line 0 comments on the whole file":       {0, false},
+		"line in the diff anchors the thread":     {2, 2, true, 7},
+		"range anchors first to last whole line":  {2, 3, true, 9}, // 🌍 is two UTF-16 units
+		"unknown line comments on the whole file": {99, 99, false, 0},
+		"line 0 comments on the whole file":       {0, 0, false, 0},
+		"range leaving the diff is file-level":    {1, 2, false, 0},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -134,7 +141,7 @@ func TestPostFileComment(t *testing.T) {
 			srv := fakeAzdo(t, &posted)
 			defer srv.Close()
 
-			err := newAzdoClient(srv.URL, "test-pat").PostFileComment(context.Background(), testPR(t), 3, file, tc.line, "note")
+			err := newAzdoClient(srv.URL, "test-pat").PostFileComment(context.Background(), testPR(t), 3, file, tc.line, tc.lastLine, "note")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,8 +153,14 @@ func TestPostFileComment(t *testing.T) {
 				t.Errorf("filePath = %v", threadContext["filePath"])
 			}
 			start, hasLine := threadContext["rightFileStart"].(map[string]any)
-			if hasLine != tc.wantLine || (hasLine && start["line"] != float64(tc.line)) {
+			if hasLine != tc.wantLine || (hasLine && (start["line"] != float64(tc.line) || start["offset"] != float64(1))) {
 				t.Errorf("rightFileStart = %v, want a line: %t", threadContext["rightFileStart"], tc.wantLine)
+			}
+			if hasLine {
+				end := threadContext["rightFileEnd"].(map[string]any)
+				if end["line"] != float64(tc.lastLine) || end["offset"] != tc.wantEndOffset {
+					t.Errorf("rightFileEnd = %v, want line %d offset %v (just past the last character)", end, tc.lastLine, tc.wantEndOffset)
+				}
 			}
 			prContext := posted["pullRequestThreadContext"].(map[string]any)
 			iterations := prContext["iterationContext"].(map[string]any)

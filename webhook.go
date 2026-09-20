@@ -68,7 +68,7 @@ func (pr pullRequest) hasReviewer(id string) bool {
 type prClient interface {
 	Diff(ctx context.Context, pr pullRequest) (prDiff, error)
 	PostComment(ctx context.Context, pr pullRequest, status threadStatus, markdown string) error
-	PostFileComment(ctx context.Context, pr pullRequest, iteration int, file fileChange, line int, markdown string) error
+	PostFileComment(ctx context.Context, pr pullRequest, iteration int, file fileChange, firstLine, lastLine int, markdown string) error
 	UpdatePR(ctx context.Context, pr pullRequest, title, description string) error
 }
 
@@ -226,7 +226,13 @@ func (h *webhookHandler) review(ctx context.Context, pr pullRequest, diff prDiff
 		markdown := "**🤖 AI Assistant:** " + c.Comment
 		if file, ok := files[strings.TrimPrefix(c.File, "/")]; ok {
 			// A line the model got wrong becomes a comment on the whole file.
-			err = h.prs.PostFileComment(ctx, pr, diff.Iteration, file, c.Line, markdown)
+			lastLine := max(c.Line, c.EndLine)
+			if block := suggestionBlock(file, c.Line, lastLine, c.Suggestion); block != "" {
+				markdown += "\n\n" + block
+			} else {
+				lastLine = c.Line // without a suggestion, point at the one line
+			}
+			err = h.prs.PostFileComment(ctx, pr, diff.Iteration, file, c.Line, lastLine, markdown)
 		} else {
 			err = h.prs.PostComment(ctx, pr, threadActive, fmt.Sprintf("**🤖 AI Assistant** on `%s`: %s", c.File, c.Comment))
 		}
@@ -235,6 +241,28 @@ func (h *webhookHandler) review(ctx context.Context, pr pullRequest, diff prDiff
 		}
 	}
 	return len(comments), nil
+}
+
+// maxSuggestionSpan is the most lines one suggestion may replace.
+const maxSuggestionSpan = 20
+
+// suggestionBlock renders replacement text for lines first through last of
+// file as an Azure DevOps suggestion, which the author can apply with one
+// click. It returns "" for a suggestion that is not safe to offer: no text, a
+// range that is not wholly in the diff, a no-op, or text that would break out
+// of the code fence.
+func suggestionBlock(file fileChange, first, last int, suggestion string) string {
+	suggestion = strings.Trim(suggestion, "\r\n")
+	switch {
+	case strings.TrimSpace(suggestion) == "",
+		!file.hasLines(first, last),
+		last-first >= maxSuggestionSpan,
+		last > len(file.After),
+		strings.Contains(suggestion, "```"),
+		suggestion == strings.Join(file.After[first-1:last], "\n"):
+		return ""
+	}
+	return "```suggestion\n" + suggestion + "\n```"
 }
 
 func suggestionComment(result enhancement, diff prDiff) string {

@@ -19,6 +19,7 @@ type prUpdate struct{ title, description string }
 type fileComment struct {
 	path      string
 	line      int
+	lastLine  int
 	iteration int
 	markdown  string
 }
@@ -37,8 +38,11 @@ func newFakePRs() *fakePRs {
 	return &fakePRs{diff: prDiff{
 		Iteration: 2,
 		Text:      "--- a/README.md\n+++ b/README.md\n",
-		Files:     []fileChange{{Path: "/README.md", ChangeType: "edit", ChangeTrackingID: 1, Lines: map[int]bool{1: true, 2: true}}},
-		Omitted:   []string{"/logo.png (add, binary file)"},
+		Files: []fileChange{{
+			Path: "/README.md", ChangeType: "edit", ChangeTrackingID: 1,
+			Lines: map[int]bool{1: true, 2: true}, After: []string{"# Demo", "Helo!"},
+		}},
+		Omitted: []string{"/logo.png (add, binary file)"},
 	}}
 }
 
@@ -52,10 +56,10 @@ func (f *fakePRs) PostComment(_ context.Context, _ pullRequest, status threadSta
 	return nil
 }
 
-func (f *fakePRs) PostFileComment(_ context.Context, _ pullRequest, iteration int, file fileChange, line int, markdown string) error {
+func (f *fakePRs) PostFileComment(_ context.Context, _ pullRequest, iteration int, file fileChange, firstLine, lastLine int, markdown string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.fileComments = append(f.fileComments, fileComment{file.Path, line, iteration, markdown})
+	f.fileComments = append(f.fileComments, fileComment{file.Path, firstLine, lastLine, iteration, markdown})
 	return nil
 }
 
@@ -330,5 +334,58 @@ func TestEnhancedPRIsStillReviewed(t *testing.T) {
 	}
 	if rev.calls != 1 || len(prs.fileComments) != 1 {
 		t.Errorf("reviewer calls = %d, file comments = %d, want 1 and 1", rev.calls, len(prs.fileComments))
+	}
+}
+
+func TestReviewSuggestions(t *testing.T) {
+	prs := newFakePRs()
+	rev := &fakeReviewer{comments: []reviewComment{
+		{File: "/README.md", Line: 2, EndLine: 2, Comment: "Typo.", Suggestion: "Hello!\n"},
+		{File: "/README.md", Line: 1, EndLine: 2, Comment: "Merge these.", Suggestion: "# Demo: Hello!"},
+		{File: "/README.md", Line: 2, EndLine: 0, Comment: "No replacement offered."},
+		{File: "/README.md", Line: 2, EndLine: 9, Comment: "Range runs past the diff.", Suggestion: "x"},
+	}}
+	h := &webhookHandler{aiReviewerID: testReviewerID, mode: modeUpdate, prs: prs, enhancer: newFakeEnhancer(), reviewer: rev}
+
+	deliver(h, payload(t, nil), "")
+	if len(prs.fileComments) != 4 {
+		t.Fatalf("posted %d file comments, want 4", len(prs.fileComments))
+	}
+	single, multi, plain, bad := prs.fileComments[0], prs.fileComments[1], prs.fileComments[2], prs.fileComments[3]
+
+	if !strings.HasSuffix(single.markdown, "Typo.\n\n```suggestion\nHello!\n```") || single.line != 2 || single.lastLine != 2 {
+		t.Errorf("single-line suggestion = %+v", single)
+	}
+	if !strings.Contains(multi.markdown, "```suggestion\n# Demo: Hello!\n```") || multi.line != 1 || multi.lastLine != 2 {
+		t.Errorf("multi-line suggestion = %+v, want it anchored to lines 1-2, the range it replaces", multi)
+	}
+	for name, c := range map[string]fileComment{"no suggestion": plain, "invalid range": bad} {
+		if strings.Contains(c.markdown, "```suggestion") || c.line != 2 || c.lastLine != 2 {
+			t.Errorf("%s: %+v, want a plain comment on line 2", name, c)
+		}
+	}
+}
+
+func TestSuggestionBlockRejectsUnsafeSuggestions(t *testing.T) {
+	file := fileChange{Lines: map[int]bool{1: true, 2: true}, After: []string{"# Demo", "Helo!", "not in the diff"}}
+	if got := suggestionBlock(file, 2, 2, "\tHello!  \n"); got != "```suggestion\n\tHello!  \n```" {
+		t.Errorf("valid suggestion = %q, want it kept with its indentation", got)
+	}
+	tests := map[string]struct {
+		first, last int
+		suggestion  string
+	}{
+		"empty":                {2, 2, "  \n"},
+		"no-op":                {2, 2, "Helo!"},
+		"whole-file comment":   {0, 0, "x"},
+		"line not in the diff": {3, 3, "x"},
+		"range leaves diff":    {2, 3, "x"},
+		"reversed range":       {2, 1, "x"},
+		"breaks the fence":     {2, 2, "```\nrm -rf /\n```"},
+	}
+	for name, tc := range tests {
+		if got := suggestionBlock(file, tc.first, tc.last, tc.suggestion); got != "" {
+			t.Errorf("%s: suggestionBlock = %q, want it rejected", name, got)
+		}
 	}
 }

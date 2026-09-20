@@ -33,6 +33,43 @@ func TestReview(t *testing.T) {
 	}
 }
 
+func TestReviewSuggestionsAreOptIn(t *testing.T) {
+	reply := `{"comments":[{"file":"/README.md","line":2,"end_line":2,"comment":"Typo.","suggestion":"Hello!"}]}`
+	schemaFields := func(ai *fakeAI) map[string]any {
+		format := ai.lastBody["response_format"].(map[string]any)["json_schema"].(map[string]any)["schema"].(map[string]any)
+		return format["properties"].(map[string]any)["comments"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	}
+	systemPrompt := func(ai *fakeAI) string {
+		return ai.lastBody["messages"].([]any)[0].(map[string]any)["content"].(string)
+	}
+
+	off := &fakeAI{reply: reply}
+	got, err := newOpenAIClient(off.start(t).URL+"/v1", "m", "").Review(context.Background(), testPR(t), testDiff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Suggestion != "" {
+		t.Errorf("suggestion = %q with suggestions off; a server ignoring the schema must not sneak one in", got[0].Suggestion)
+	}
+	if _, asked := schemaFields(off)["suggestion"]; asked || strings.Contains(systemPrompt(off), "suggestion") {
+		t.Errorf("suggestions off, but the request still asks for them")
+	}
+
+	on := &fakeAI{reply: reply}
+	client := newOpenAIClient(on.start(t).URL+"/v1", "m", "")
+	client.suggestions = true
+	got, err = client.Review(context.Background(), testPR(t), testDiff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Suggestion != "Hello!" || got[0].EndLine != 2 {
+		t.Errorf("comment = %+v, want the suggestion and its range", got[0])
+	}
+	if _, asked := schemaFields(on)["suggestion"]; !asked || !strings.Contains(systemPrompt(on), `"suggestion"`) {
+		t.Errorf("suggestions on, but the request does not ask for them")
+	}
+}
+
 func TestReviewCapsComments(t *testing.T) {
 	var items []string
 	for i := 0; i < maxReviewComments+5; i++ {
@@ -68,13 +105,21 @@ func TestReviewLive(t *testing.T) {
 	pr := testPR(t)
 	pr.Title, pr.Description = "Simplify refund query", "Small cleanup."
 
-	got, err := newOpenAIClient(baseURL, os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY")).Review(ctx, pr, diff)
+	file := fileChange{Path: "/pay/refund.go", Lines: lines, After: strings.Split(strings.TrimSuffix(after, "\n"), "\n")}
+	client := newOpenAIClient(baseURL, os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY"))
+	client.suggestions = true
+	got, err := client.Review(ctx, pr, diff)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("diff shown to the model:\n%s", numbered)
 	for _, c := range got {
-		t.Logf("%s:%d (line shown: %t): %s", c.File, c.Line, lines[c.Line], c.Comment)
+		t.Logf("%s:%d-%d (line shown: %t): %s", c.File, c.Line, c.EndLine, lines[c.Line], c.Comment)
+		if block := suggestionBlock(file, c.Line, max(c.Line, c.EndLine), c.Suggestion); block != "" {
+			t.Logf("accepted suggestion:\n%s", block)
+		} else if c.Suggestion != "" {
+			t.Logf("REJECTED suggestion: %q", c.Suggestion)
+		}
 	}
 	if len(got) == 0 {
 		t.Errorf("no comments on a diff that introduces SQL injection and drops an error")

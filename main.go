@@ -29,6 +29,7 @@ type config struct {
 	aiModel       string
 	aiAPIKey      string
 	review        bool
+	suggestions   bool
 }
 
 func loadConfig() (config, error) {
@@ -62,6 +63,11 @@ func loadConfig() (config, error) {
 		return cfg, fmt.Errorf("REVIEW_COMMENTS must be true or false, not %q", os.Getenv("REVIEW_COMMENTS"))
 	}
 	cfg.review = review
+	suggestions, err := strconv.ParseBool(envOr("REVIEW_SUGGESTIONS", "false"))
+	if err != nil {
+		return cfg, fmt.Errorf("REVIEW_SUGGESTIONS must be true or false, not %q", os.Getenv("REVIEW_SUGGESTIONS"))
+	}
+	cfg.suggestions = suggestions
 	if cfg.mode != modeUpdate && cfg.mode != modeSuggest {
 		return cfg, fmt.Errorf("ENHANCE_MODE must be %q or %q, not %q", modeUpdate, modeSuggest, cfg.mode)
 	}
@@ -85,6 +91,7 @@ func main() {
 	}
 
 	ai := newOpenAIClient(cfg.aiBaseURL, cfg.aiModel, cfg.aiAPIKey)
+	ai.suggestions = cfg.suggestions
 	handler := &webhookHandler{
 		aiReviewerID: cfg.aiReviewerID,
 		secret:       cfg.webhookSecret,
@@ -115,8 +122,8 @@ func main() {
 		}
 	}()
 
-	log.Printf("listening on %s (AI reviewer %s, AI server %s, %s mode, review comments %t)",
-		cfg.addr, cfg.aiReviewerID, cfg.aiBaseURL, cfg.mode, cfg.review)
+	log.Printf("listening on %s (AI reviewer %s, AI server %s, %s mode, review comments %t, suggestions %t)",
+		cfg.addr, cfg.aiReviewerID, cfg.aiBaseURL, cfg.mode, cfg.review, cfg.review && cfg.suggestions)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

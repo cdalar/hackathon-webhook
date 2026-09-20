@@ -18,6 +18,8 @@ type openAIClient struct {
 	model   string // empty: use the first model the server lists
 	apiKey  string // empty: send no Authorization header
 	http    *http.Client
+
+	suggestions bool // ask reviews for one-click replacement code too
 }
 
 func newOpenAIClient(baseURL, model, apiKey string) *openAIClient {

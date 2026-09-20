@@ -44,6 +44,15 @@ Azure DevOps PR ──(service hook: reviewers changed)──▶ POST /webhook
    the file as a whole. At most 10 comments per review, and a review with
    nothing to flag says so in a single comment.
 
+6. With `REVIEW_SUGGESTIONS=true`, the AI may attach a **suggested change** to a
+   finding: replacement code for the exact lines the comment is on, which the
+   author can apply to the PR branch with one click. It is asked to do so only
+   when the fix is a clean replacement of those lines; other findings stay
+   plain comments. The receiver drops any suggestion it can't vouch for — a
+   range that isn't wholly inside the diff or spans more than 20 lines, a
+   no-op, or text that would break out of the suggestion block — and posts the
+   comment without it. Nothing is ever applied automatically.
+
 Informational comments — the saved originals, "no comments", "nothing to read" —
 are created already **closed**, so they never count against a "comments must be
 resolved" branch policy. Review findings are created **active**, because those
@@ -76,6 +85,7 @@ cannot act on its own — so a dedicated service account gives the cleanest resu
 | `AI_API_KEY` | no | Sent as a bearer token if set. Local servers usually need none. |
 | `ENHANCE_MODE` | no | `update` (default) rewrites the PR; `suggest` only comments. |
 | `REVIEW_COMMENTS` | no | `true` (default) posts review comments on the changed files; `false` turns the review off. |
+| `REVIEW_SUGGESTIONS` | no | `true` lets review comments carry one-click suggested changes; default `false`. Needs `REVIEW_COMMENTS`. Reviews take noticeably longer with it on. |
 | `WEBHOOK_SECRET` | recommended | If set, deliveries must send this as the HTTP basic-auth password. |
 | `LISTEN_ADDR` | no | Listen address, default `:8080`. |
 
