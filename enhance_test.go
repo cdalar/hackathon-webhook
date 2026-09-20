@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,10 +41,13 @@ func (f *fakeAI) start(t *testing.T) *httptest.Server {
 		if finish == "" {
 			finish = "stop"
 		}
-		resp := map[string]any{"choices": []map[string]any{{
-			"finish_reason": finish,
-			"message":       map[string]string{"role": "assistant", "content": f.reply},
-		}}}
+		resp := map[string]any{
+			"choices": []map[string]any{{
+				"finish_reason": finish,
+				"message":       map[string]string{"role": "assistant", "content": f.reply},
+			}},
+			"usage": map[string]int{"prompt_tokens": 100, "completion_tokens": 20},
+		}
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			t.Error(err)
 		}
@@ -108,6 +112,52 @@ func TestEnhanceDiscoversModelAndSkipsAuth(t *testing.T) {
 	}
 }
 
+func TestThinkingBudgetAndExtraBody(t *testing.T) {
+	reply := `{"title":"T","description":"D"}`
+
+	// Unset: strict APIs reject unknown fields, so nothing extra may be sent.
+	plain := &fakeAI{reply: reply}
+	if _, err := newOpenAIClient(plain.start(t).URL+"/v1", "m", "").Enhance(context.Background(), testPR(t), testDiff); err != nil {
+		t.Fatal(err)
+	}
+	if len(plain.lastBody) != 3 {
+		t.Errorf("request fields = %v, want only model, messages, response_format", keys(plain.lastBody))
+	}
+
+	// A budget of 0 means "no thinking" and must be sent, unlike unset.
+	capped := &fakeAI{reply: reply}
+	client := newOpenAIClient(capped.start(t).URL+"/v1", "m", "")
+	client.thinkingBudget = 0
+	client.extraBody = map[string]any{
+		"chat_template_kwargs": map[string]any{"enable_thinking": false},
+		"model":                "hijacked",
+		"messages":             "hijacked",
+	}
+	if _, err := client.Enhance(context.Background(), testPR(t), testDiff); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := capped.lastBody["thinking_budget_tokens"]; !ok || got != float64(0) {
+		t.Errorf("thinking_budget_tokens = %v (sent: %t), want 0", got, ok)
+	}
+	if _, ok := capped.lastBody["chat_template_kwargs"].(map[string]any); !ok {
+		t.Errorf("extra body field missing from request: %v", keys(capped.lastBody))
+	}
+	if capped.lastModel != "m" {
+		t.Errorf("model = %q: the extra body must not replace core fields", capped.lastModel)
+	}
+	if _, ok := capped.lastBody["messages"].([]any); !ok {
+		t.Errorf("messages = %v: the extra body must not replace core fields", capped.lastBody["messages"])
+	}
+}
+
+func keys(m map[string]any) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 func TestEnhanceToleratesWrappedJSON(t *testing.T) {
 	ai := &fakeAI{reply: "Here you go:\n```json\n{\"title\":\"T\",\"description\":\"uses {braces}\"}\n```"}
 	srv := ai.start(t)
@@ -151,20 +201,36 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-// TestEnhanceLive runs against a real OpenAI-compatible server:
-//
-//	AI_BASE_URL=http://my-llm-host:8080/v1 go test -run TestEnhanceLive -v .
-func TestEnhanceLive(t *testing.T) {
+// liveClient builds a client for the live tests from the same environment
+// variables the receiver reads, or skips the test if AI_BASE_URL is not set.
+func liveClient(t *testing.T) *openAIClient {
+	t.Helper()
 	baseURL := os.Getenv("AI_BASE_URL")
 	if baseURL == "" {
 		t.Skip("AI_BASE_URL not set")
 	}
+	client := newOpenAIClient(baseURL, os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY"))
+	if v := os.Getenv("AI_THINKING_BUDGET"); v != "" {
+		budget, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("AI_THINKING_BUDGET: %v", err)
+		}
+		client.thinkingBudget = budget
+	}
+	return client
+}
+
+// TestEnhanceLive runs against a real OpenAI-compatible server:
+//
+//	AI_BASE_URL=http://my-llm-host:8080/v1 go test -run TestEnhanceLive -v .
+func TestEnhanceLive(t *testing.T) {
+	client := liveClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	pr := testPR(t)
 	pr.Title, pr.Description = "fix", "see AB#1234"
-	got, err := newOpenAIClient(baseURL, os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY")).Enhance(ctx, pr, testDiff)
+	got, err := client.Enhance(ctx, pr, testDiff)
 	if err != nil {
 		t.Fatal(err)
 	}

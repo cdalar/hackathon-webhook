@@ -63,7 +63,7 @@ func (c *openAIClient) Review(ctx context.Context, pr pullRequest, diff prDiff) 
 	var result struct {
 		Comments []reviewComment `json:"comments"`
 	}
-	err := c.chatJSON(ctx, system, prompt.String(), "review", map[string]any{
+	err := c.chatJSON(ctx, fmt.Sprintf("PR %d: review of %d file(s)", pr.ID, len(diff.Files)), system, prompt.String(), "review", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"comments": map[string]any{

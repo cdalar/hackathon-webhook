@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // openAIClient calls any server that implements the OpenAI chat completions
@@ -20,15 +22,22 @@ type openAIClient struct {
 	http    *http.Client
 
 	suggestions bool // ask reviews for one-click replacement code too
+
+	// thinkingBudget caps a reasoning model's hidden thinking, in tokens, via
+	// llama.cpp's thinking_budget_tokens. Negative: no cap, field not sent.
+	thinkingBudget int
+	// extraBody is merged into every chat request, for server-specific
+	// options. It cannot replace the fields chatJSON sets itself.
+	extraBody map[string]any
 }
 
 func newOpenAIClient(baseURL, model, apiKey string) *openAIClient {
-	return &openAIClient{baseURL: strings.TrimRight(baseURL, "/"), model: model, apiKey: apiKey, http: &http.Client{}}
+	return &openAIClient{baseURL: strings.TrimRight(baseURL, "/"), model: model, apiKey: apiKey, http: &http.Client{}, thinkingBudget: -1}
 }
 
 // chatJSON sends one system + user exchange and decodes the model's JSON
-// answer, which must match schema, into out.
-func (c *openAIClient) chatJSON(ctx context.Context, system, user, schemaName string, schema map[string]any, out any) error {
+// answer, which must match schema, into out. label names the call in the log.
+func (c *openAIClient) chatJSON(ctx context.Context, label, system, user, schemaName string, schema map[string]any, out any) error {
 	model, err := c.resolveModel(ctx)
 	if err != nil {
 		return err
@@ -37,16 +46,21 @@ func (c *openAIClient) chatJSON(ctx context.Context, system, user, schemaName st
 	// No max_tokens or temperature: reasoning models spend an unpredictable
 	// number of tokens thinking before they answer, and some hosted models
 	// reject one or both parameters. The request context bounds the call.
-	request := map[string]any{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "system", "content": system},
-			{"role": "user", "content": user},
-		},
-		"response_format": map[string]any{
-			"type":        "json_schema",
-			"json_schema": map[string]any{"name": schemaName, "strict": true, "schema": schema},
-		},
+	request := make(map[string]any, len(c.extraBody)+4)
+	for k, v := range c.extraBody {
+		request[k] = v
+	}
+	if c.thinkingBudget >= 0 {
+		request["thinking_budget_tokens"] = c.thinkingBudget
+	}
+	request["model"] = model
+	request["messages"] = []map[string]string{
+		{"role": "system", "content": system},
+		{"role": "user", "content": user},
+	}
+	request["response_format"] = map[string]any{
+		"type":        "json_schema",
+		"json_schema": map[string]any{"name": schemaName, "strict": true, "schema": schema},
 	}
 	var response struct {
 		Choices []struct {
@@ -55,10 +69,21 @@ func (c *openAIClient) chatJSON(ctx context.Context, system, user, schemaName st
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
 	}
+	log.Printf("%s: asking %s (%d KB prompt)", label, model, (len(system)+len(user)+512)/1024)
+	started := time.Now()
 	if err := c.call(ctx, http.MethodPost, "/chat/completions", request, &response); err != nil {
+		log.Printf("%s: AI call failed after %s", label, time.Since(started).Round(time.Second))
 		return err
 	}
+	// Completion tokens include hidden thinking, so they show what a slow
+	// answer was spent on.
+	log.Printf("%s: answered in %s (%d prompt + %d completion tokens)", label,
+		time.Since(started).Round(time.Second), response.Usage.PromptTokens, response.Usage.CompletionTokens)
 	if len(response.Choices) == 0 {
 		return errors.New("AI server returned no choices")
 	}

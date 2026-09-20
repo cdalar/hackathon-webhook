@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -30,6 +31,9 @@ type config struct {
 	aiAPIKey      string
 	review        bool
 	suggestions   bool
+
+	aiThinkingBudget int // negative: not set
+	aiExtraBody      map[string]any
 }
 
 func loadConfig() (config, error) {
@@ -68,6 +72,20 @@ func loadConfig() (config, error) {
 		return cfg, fmt.Errorf("REVIEW_SUGGESTIONS must be true or false, not %q", os.Getenv("REVIEW_SUGGESTIONS"))
 	}
 	cfg.suggestions = suggestions
+
+	cfg.aiThinkingBudget = -1
+	if v := os.Getenv("AI_THINKING_BUDGET"); v != "" {
+		budget, err := strconv.Atoi(v)
+		if err != nil || budget < 0 {
+			return cfg, fmt.Errorf("AI_THINKING_BUDGET must be a number of tokens, 0 or more, not %q", v)
+		}
+		cfg.aiThinkingBudget = budget
+	}
+	if v := os.Getenv("AI_EXTRA_BODY"); v != "" {
+		if err := json.Unmarshal([]byte(v), &cfg.aiExtraBody); err != nil {
+			return cfg, fmt.Errorf("AI_EXTRA_BODY must be a JSON object: %w", err)
+		}
+	}
 	if cfg.mode != modeUpdate && cfg.mode != modeSuggest {
 		return cfg, fmt.Errorf("ENHANCE_MODE must be %q or %q, not %q", modeUpdate, modeSuggest, cfg.mode)
 	}
@@ -92,6 +110,8 @@ func main() {
 
 	ai := newOpenAIClient(cfg.aiBaseURL, cfg.aiModel, cfg.aiAPIKey)
 	ai.suggestions = cfg.suggestions
+	ai.thinkingBudget = cfg.aiThinkingBudget
+	ai.extraBody = cfg.aiExtraBody
 	handler := &webhookHandler{
 		aiReviewerID: cfg.aiReviewerID,
 		secret:       cfg.webhookSecret,
@@ -124,6 +144,9 @@ func main() {
 
 	log.Printf("listening on %s (AI reviewer %s, AI server %s, %s mode, review comments %t, suggestions %t)",
 		cfg.addr, cfg.aiReviewerID, cfg.aiBaseURL, cfg.mode, cfg.review, cfg.review && cfg.suggestions)
+	if cfg.aiThinkingBudget >= 0 {
+		log.Printf("AI thinking capped at %d tokens", cfg.aiThinkingBudget)
+	}
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

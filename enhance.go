@@ -44,7 +44,7 @@ func (c *openAIClient) Enhance(ctx context.Context, pr pullRequest, diff prDiff)
 	}
 
 	var result enhancement
-	err := c.chatJSON(ctx, enhanceSystemPrompt, prompt.String(), "pull_request", map[string]any{
+	err := c.chatJSON(ctx, fmt.Sprintf("PR %d: title and description", pr.ID), enhanceSystemPrompt, prompt.String(), "pull_request", map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"title":       map[string]string{"type": "string"},

@@ -48,10 +48,15 @@ Azure DevOps PR ──(service hook: reviewers changed)──▶ POST /webhook
    finding: replacement code for the exact lines the comment is on, which the
    author can apply to the PR branch with one click. It is asked to do so only
    when the fix is a clean replacement of those lines; other findings stay
-   plain comments. The receiver drops any suggestion it can't vouch for — a
-   range that isn't wholly inside the diff or spans more than 20 lines, a
-   no-op, or text that would break out of the suggestion block — and posts the
-   comment without it. Nothing is ever applied automatically.
+   plain comments. The receiver re-bases each suggestion on the indentation of
+   the lines it replaces (models often drop it) and drops any suggestion it
+   can't vouch for — a range that isn't wholly inside the diff or spans more
+   than 20 lines, a no-op, brackets that don't balance the way the replaced
+   lines do, text that would break out of the suggestion block, or, in Python
+   and YAML files, indentation that needed repair — and posts the comment
+   without it. These checks catch malformed suggestions, not wrong ones: the
+   author still reads the diff before applying. Nothing is applied
+   automatically.
 
 Informational comments — the saved originals, "no comments", "nothing to read" —
 are created already **closed**, so they never count against a "comments must be
@@ -83,6 +88,8 @@ cannot act on its own — so a dedicated service account gives the cleanest resu
 | `AI_BASE_URL` | yes | Base URL of an OpenAI-compatible API, including `/v1`. See the examples below. |
 | `AI_MODEL` | no | Model name to request. Default: the first model the server lists, which suits single-model local servers. |
 | `AI_API_KEY` | no | Sent as a bearer token if set. Local servers usually need none. |
+| `AI_THINKING_BUDGET` | no | Caps a reasoning model's hidden thinking, in tokens; `0` turns thinking off. Unset: no cap. Sent as llama.cpp's `thinking_budget_tokens`; see below for other servers. |
+| `AI_EXTRA_BODY` | no | A JSON object merged into every chat request, for server-specific options. It cannot replace `model`, `messages`, or `response_format`. |
 | `ENHANCE_MODE` | no | `update` (default) rewrites the PR; `suggest` only comments. |
 | `REVIEW_COMMENTS` | no | `true` (default) posts review comments on the changed files; `false` turns the review off. |
 | `REVIEW_SUGGESTIONS` | no | `true` lets review comments carry one-click suggested changes; default `false`. Needs `REVIEW_COMMENTS`. Reviews take noticeably longer with it on. |
@@ -99,9 +106,52 @@ Typical `AI_BASE_URL` values:
 | LM Studio | `http://my-llm-host:1234/v1` |
 
 Reasoning models work: the receiver sets no output-token cap, so a model can
-think before it answers, and each run is bounded by a 10-minute timeout instead.
+think before it answers, and each run is bounded by a 15-minute timeout instead.
 The server must support `response_format` JSON schemas or at least reply with a
 JSON object; all four servers above do.
+
+### Keeping a reasoning model quick
+
+A reasoning model can spend thousands of hidden tokens thinking about a review —
+minutes on local hardware. The log shows what each call cost:
+
+```
+PR 42: review of 3 file(s): asking my-model (6 KB prompt)
+PR 42: review of 3 file(s): answered in 5m31s (1372 prompt + 12034 completion tokens)
+```
+
+Completion tokens include the hidden thinking, so a large number next to a short
+answer means the time went into reasoning. To rein that in:
+
+| Server | Setting |
+|---|---|
+| llama.cpp | `AI_THINKING_BUDGET=2048` (or `0` for none) |
+| llama.cpp, vLLM — models whose chat template has the switch | `AI_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}` |
+| OpenAI and compatible hosted APIs | `AI_EXTRA_BODY={"reasoning_effort":"low"}` |
+
+How far to cap depends on what you ask of the model. Replaying one small PR with
+seven planted bugs through a 26B local reasoning model:
+
+| Thinking budget | Review time | Planted bugs found | Suggested changes |
+|---|---|---|---|
+| unlimited | 4–5 min | 6–7 of 7 | all correct |
+| `4096` | 2 min | 7 of 7 | all correct |
+| `1024` | 45 s | 7 of 7 | one replaced the wrong line range |
+| `0` | 20 s | 7 of 7 | three would have broken the code |
+
+Findings hold up with little or no thinking; replacement code does not, because
+choosing exactly which lines to replace is where the thinking goes. So with
+`REVIEW_SUGGESTIONS=true` leave the model around 4000 tokens, and with
+suggestions off a budget of `1024` or even `0` gives the same findings many times
+faster. Your model and hardware will differ; the log lines above make it a
+two-minute experiment.
+
+Servers silently ignore options they don't know (llama.cpp ignores
+`reasoning_effort`, for one), so check the token counts in the log to see whether
+a setting took effect. Both settings are left out of the request entirely when
+unset, because strict APIs reject fields they don't recognise. On llama.cpp you
+can also watch a request in flight: `curl -s http://my-llm-host:8080/slots` lists
+each slot with `is_processing` and the tokens generated so far.
 
 To find the reviewer group's ID:
 

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -91,10 +90,7 @@ func TestReviewCapsComments(t *testing.T) {
 //
 //	AI_BASE_URL=http://my-llm-host:8080/v1 go test -run TestReviewLive -v .
 func TestReviewLive(t *testing.T) {
-	baseURL := os.Getenv("AI_BASE_URL")
-	if baseURL == "" {
-		t.Skip("AI_BASE_URL not set")
-	}
+	client := liveClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -106,7 +102,6 @@ func TestReviewLive(t *testing.T) {
 	pr.Title, pr.Description = "Simplify refund query", "Small cleanup."
 
 	file := fileChange{Path: "/pay/refund.go", Lines: lines, After: strings.Split(strings.TrimSuffix(after, "\n"), "\n")}
-	client := newOpenAIClient(baseURL, os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY"))
 	client.suggestions = true
 	got, err := client.Review(ctx, pr, diff)
 	if err != nil {

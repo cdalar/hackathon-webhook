@@ -249,20 +249,113 @@ const maxSuggestionSpan = 20
 // suggestionBlock renders replacement text for lines first through last of
 // file as an Azure DevOps suggestion, which the author can apply with one
 // click. It returns "" for a suggestion that is not safe to offer: no text, a
-// range that is not wholly in the diff, a no-op, or text that would break out
-// of the code fence.
+// range that is not wholly in the diff, a no-op, text that would break out of
+// the code fence, or brackets that don't balance the way the replaced lines do.
 func suggestionBlock(file fileChange, first, last int, suggestion string) string {
 	suggestion = strings.Trim(suggestion, "\r\n")
-	switch {
-	case strings.TrimSpace(suggestion) == "",
-		!file.hasLines(first, last),
-		last-first >= maxSuggestionSpan,
-		last > len(file.After),
-		strings.Contains(suggestion, "```"),
-		suggestion == strings.Join(file.After[first-1:last], "\n"):
+	if strings.TrimSpace(suggestion) == "" || !file.hasLines(first, last) ||
+		last-first >= maxSuggestionSpan || last > len(file.After) || strings.Contains(suggestion, "```") {
+		return ""
+	}
+	replaced := strings.Join(file.After[first-1:last], "\n")
+	repaired := reindent(suggestion, replaced)
+	if repaired != suggestion && indentSensitive(file.Path) {
+		return ""
+	}
+	suggestion = repaired
+	if suggestion == replaced || bracketBalance(suggestion) != bracketBalance(replaced) {
 		return ""
 	}
 	return "```suggestion\n" + suggestion + "\n```"
+}
+
+// reindent re-bases a suggestion on the indentation of the lines it replaces.
+// Models tend to drop the leading whitespace of a reply's first line, or to
+// write the whole block flush left while keeping its nesting; both come out
+// right. A reply whose lines are indented inconsistently can't be repaired,
+// only re-based, which is cosmetic in brace languages but not in others, so
+// callers reject a changed result for indentation-sensitive files.
+func reindent(suggestion, replaced string) string {
+	base := ""
+	for _, line := range strings.Split(replaced, "\n") {
+		if strings.TrimSpace(line) != "" {
+			base = leadingSpace(line)
+			break
+		}
+	}
+	lines := strings.Split(suggestion, "\n")
+
+	// A first line with no indentation, above lines that share some, lost its
+	// own; unless the code it replaces starts at column 0 too.
+	if rest := commonIndent(lines[1:]); base != "" && rest != "" && leadingSpace(lines[0]) == "" {
+		lines[0] = rest + lines[0]
+	}
+	own := commonIndent(lines)
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			lines[i] = ""
+		} else {
+			lines[i] = base + strings.TrimPrefix(line, own)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func leadingSpace(line string) string {
+	return line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+}
+
+// commonIndent is the longest leading whitespace shared by all non-blank lines.
+func commonIndent(lines []string) string {
+	common, seen := "", false
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := leadingSpace(line)
+		if !seen {
+			common, seen = indent, true
+			continue
+		}
+		for !strings.HasPrefix(indent, common) {
+			common = common[:len(common)-1]
+		}
+	}
+	return common
+}
+
+// indentSensitive reports whether indentation carries meaning in the file, so
+// that a suggestion whose indentation had to be repaired is not safe to offer.
+func indentSensitive(path string) bool {
+	switch strings.ToLower(path[strings.LastIndexByte(path, '.')+1:]) {
+	case "py", "pyi", "yaml", "yml":
+		return true
+	}
+	return false
+}
+
+// bracketBalance is the net count of opening minus closing brackets. A
+// suggestion that closes a block its lines didn't open, or the reverse, would
+// leave the file unbalanced. Brackets inside strings make this approximate; a
+// mismatch only costs the suggestion, never the comment.
+func bracketBalance(code string) (balance [3]int) {
+	for _, r := range code {
+		switch r {
+		case '{':
+			balance[0]++
+		case '}':
+			balance[0]--
+		case '(':
+			balance[1]++
+		case ')':
+			balance[1]--
+		case '[':
+			balance[2]++
+		case ']':
+			balance[2]--
+		}
+	}
+	return balance
 }
 
 func suggestionComment(result enhancement, diff prDiff) string {

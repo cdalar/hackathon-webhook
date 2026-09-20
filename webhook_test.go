@@ -367,10 +367,18 @@ func TestReviewSuggestions(t *testing.T) {
 }
 
 func TestSuggestionBlockRejectsUnsafeSuggestions(t *testing.T) {
-	file := fileChange{Lines: map[int]bool{1: true, 2: true}, After: []string{"# Demo", "Helo!", "not in the diff"}}
+	file := fileChange{Lines: map[int]bool{1: true, 2: true}, After: []string{"# Demo", "\tHelo!", "not in the diff"}}
 	if got := suggestionBlock(file, 2, 2, "\tHello!  \n"); got != "```suggestion\n\tHello!  \n```" {
 		t.Errorf("valid suggestion = %q, want it kept with its indentation", got)
 	}
+	braces := fileChange{Lines: map[int]bool{1: true, 2: true, 3: true}, After: []string{"\tif err != nil {", "\t\treturn err", "\t}"}}
+	if got := suggestionBlock(braces, 3, 3, "defer f.Close()"); got != "" {
+		t.Errorf("suggestion that deletes a closing brace = %q, want it rejected", got)
+	}
+	if got := suggestionBlock(braces, 3, 3, "}\n\tdefer f.Close()"); got != "```suggestion\n\t}\n\tdefer f.Close()\n```" {
+		t.Errorf("balanced suggestion = %q, want it kept and its first line re-indented", got)
+	}
+
 	tests := map[string]struct {
 		first, last int
 		suggestion  string
@@ -387,5 +395,39 @@ func TestSuggestionBlockRejectsUnsafeSuggestions(t *testing.T) {
 		if got := suggestionBlock(file, tc.first, tc.last, tc.suggestion); got != "" {
 			t.Errorf("%s: suggestionBlock = %q, want it rejected", name, got)
 		}
+	}
+}
+
+func TestReindent(t *testing.T) {
+	tests := map[string]struct{ suggestion, replaced, want string }{
+		"first line lost its indentation": {"x := 1\n\tif x > 0 {\n\t\treturn\n\t}", "\tx := 0", "\tx := 1\n\tif x > 0 {\n\t\treturn\n\t}"},
+		"block written flush left":        {"if x > 0 {\n\treturn\n}\ndone()", "\t\tif x {", "\t\tif x > 0 {\n\t\t\treturn\n\t\t}\n\t\tdone()"},
+		"indentation intact":              {"\tx := 1\n\t\ty()", "\tx := 0", "\tx := 1\n\t\ty()"},
+		"single flush-left line":          {"x := 1", "\tx := 0", "\tx := 1"},
+		"top-level code needs none":       {"x := 1\n\ty()", "x := 0", "x := 1\n\ty()"},
+		"blank lines stay blank":          {"a()\n\n  b()", "  a()", "  a()\n\n  b()"},
+		"deeper than the replaced line":   {"\t\tx := 1\n\t\ty()", "\tx := 0", "\tx := 1\n\ty()"},
+		"replaced range starts blank":     {"x()", "\n    y()", "    x()"},
+		"spaces":                          {"x = 1\n    if x:\n        y()", "    x = 0", "    x = 1\n    if x:\n        y()"},
+	}
+	for name, tc := range tests {
+		if got := reindent(tc.suggestion, tc.replaced); got != tc.want {
+			t.Errorf("%s: reindent = %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
+func TestIndentSensitiveFilesGetNoRepairedSuggestions(t *testing.T) {
+	after := []string{"def f(x):", "    return x"}
+	py := fileChange{Path: "/app/util.py", Lines: map[int]bool{1: true, 2: true}, After: after}
+	if got := suggestionBlock(py, 2, 2, "return x + 1"); got != "" {
+		t.Errorf("repaired suggestion in a Python file = %q, want it rejected", got)
+	}
+	if got := suggestionBlock(py, 2, 2, "    return x + 1"); got != "```suggestion\n    return x + 1\n```" {
+		t.Errorf("correctly indented Python suggestion = %q, want it kept", got)
+	}
+	goFile := fileChange{Path: "/app/util.go", Lines: py.Lines, After: after}
+	if got := suggestionBlock(goFile, 2, 2, "return x + 1"); got != "```suggestion\n    return x + 1\n```" {
+		t.Errorf("repaired suggestion in a Go file = %q, want it kept", got)
 	}
 }
