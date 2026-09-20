@@ -2,8 +2,10 @@
 
 A small Go service that turns an Azure DevOps reviewer group into an AI
 assistant for pull requests. Add the **AI Assistant** group as a reviewer and it
-reads the PR's title, description, and changes, then rewrites the title and
-description so they actually say what the PR does.
+reads the PR's title, description, and changes, then:
+
+- rewrites the title and description so they actually say what the PR does, and
+- reviews the changed files, posting its comments on the lines they are about.
 
 The AI is any server that speaks the OpenAI chat completions API — a local
 llama.cpp, Ollama, vLLM, or LM Studio, or a hosted service — selected with one
@@ -17,6 +19,7 @@ Azure DevOps PR ──(service hook: reviewers changed)──▶ POST /webhook
                                                           ▼
                fetch title, description, diff ─▶ AI server ─▶ update PR title + description
                                                               (originals saved in a comment)
+                                                            ─▶ comments on changed files + lines
 ```
 
 ## How it works
@@ -33,10 +36,26 @@ Azure DevOps PR ──(service hook: reviewers changed)──▶ POST /webhook
    and then replaces them with the AI's version. In `suggest` mode it leaves the
    PR untouched and posts the proposal as a comment instead.
 
+5. Unless `REVIEW_COMMENTS=false`, it then asks the AI to review the changed
+   files and posts each comment as a thread on the file and line it names, the
+   same way a human reviewer's comments appear. The AI sees each file's diff
+   with the new file's line numbers printed on every line, so it cites lines
+   rather than computing them; a line it gets wrong anyway becomes a comment on
+   the file as a whole. At most 10 comments per review, and a review with
+   nothing to flag says so in a single comment.
+
+Informational comments — the saved originals, "no comments", "nothing to read" —
+are created already **closed**, so they never count against a "comments must be
+resolved" branch policy. Review findings are created **active**, because those
+are for the author to resolve, and so is the proposal in `suggest` mode, since a
+closed thread is collapsed out of sight.
+
 The AI is told to keep whatever the diff can't show: motivation, work item
 references like `AB#123`, links, rollout notes. Every description it writes ends
 with a footer saying it was AI-enhanced; that footer is also how the receiver
-knows not to enhance the same PR twice.
+knows not to rewrite the same description twice. The review runs once per source
+commit, so a PR that gets new commits is reviewed again the next time the hook
+fires for it.
 
 Files that are binary, larger than 256 KB, or past the first 100 changed files
 (or ~128 KB of diff) are not sent to the AI; the PR comment lists them. Output is
@@ -56,6 +75,7 @@ cannot act on its own — so a dedicated service account gives the cleanest resu
 | `AI_MODEL` | no | Model name to request. Default: the first model the server lists, which suits single-model local servers. |
 | `AI_API_KEY` | no | Sent as a bearer token if set. Local servers usually need none. |
 | `ENHANCE_MODE` | no | `update` (default) rewrites the PR; `suggest` only comments. |
+| `REVIEW_COMMENTS` | no | `true` (default) posts review comments on the changed files; `false` turns the review off. |
 | `WEBHOOK_SECRET` | recommended | If set, deliveries must send this as the HTTP basic-auth password. |
 | `LISTEN_ADDR` | no | Listen address, default `:8080`. |
 
@@ -138,11 +158,13 @@ docker run -d --name hackathon-webhook -p 127.0.0.1:8081:8080 --env-file .env \
 
 scripts/emulate-delivery.sh 42      # 42 = pull request ID; expect "HTTP 202"
 docker logs -f hackathon-webhook    # expect "PR 42: enhanced (update mode)"
+                                    #    then "PR 42: reviewed, N comments"
 ```
 
-The AI Assistant group must already be a reviewer on that PR. A PR that has been
-enhanced is skipped from then on; to run again, delete the footer from its
-description, or set `ENHANCE_MODE=suggest` to only ever comment.
+The AI Assistant group must already be a reviewer on that PR. An enhanced
+description is never rewritten again (delete its footer to force that), and a
+running receiver reviews each commit once; restart the container to review the
+same commit again.
 
 ## Azure DevOps service hook
 
@@ -166,9 +188,9 @@ go test -race ./...
 ```
 
 The tests run against in-process fakes of Azure DevOps and the AI server; they
-make no network calls and need no credentials. To try the prompt against a real
+make no network calls and need no credentials. To try the prompts against a real
 model:
 
 ```sh
-AI_BASE_URL=http://my-llm-host:8080/v1 go test -run TestEnhanceLive -v .
+AI_BASE_URL=http://my-llm-host:8080/v1 go test -run 'Live$' -v .
 ```

@@ -27,8 +27,19 @@ const (
 
 // prDiff is the textual content of a pull request's changes.
 type prDiff struct {
-	Text    string   // unified diff of all included files
-	Omitted []string // "path (change type, reason)" for every change left out of Text
+	Iteration int          // the PR iteration the diff was taken from
+	Text      string       // unified diff of all included files
+	Files     []fileChange // the same files, one by one, for commenting on
+	Omitted   []string     // "path (change type, reason)" for every change left out
+}
+
+// fileChange is one changed text file of a pull request.
+type fileChange struct {
+	Path             string
+	ChangeType       string
+	ChangeTrackingID int          // ties a comment to this change across iterations
+	Numbered         string       // diff with the new file's line number on each line
+	Lines            map[int]bool // new-file line numbers that appear in Numbered
 }
 
 // azdoClient talks to the Azure DevOps Git REST API with a personal access
@@ -123,8 +134,9 @@ func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
 
 	var changes struct {
 		ChangeEntries []struct {
-			ChangeType string `json:"changeType"`
-			Item       struct {
+			ChangeTrackingID int    `json:"changeTrackingId"`
+			ChangeType       string `json:"changeType"`
+			Item             struct {
 				Path             string `json:"path"`
 				ObjectID         string `json:"objectId"`
 				OriginalObjectID string `json:"originalObjectId"`
@@ -140,7 +152,7 @@ func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
 		return prDiff{}, err
 	}
 
-	var diff prDiff
+	diff := prDiff{Iteration: latest}
 	var text strings.Builder
 	for _, ch := range changes.ChangeEntries {
 		item := ch.Item
@@ -181,12 +193,75 @@ func (c *azdoClient) Diff(ctx context.Context, pr pullRequest) (prDiff, error) {
 			return prDiff{}, err
 		}
 		fmt.Fprintf(&text, "# %s: %s\n%s\n", ch.ChangeType, item.Path, fileDiff)
+
+		numbered, lines := numberedDiff(before, after)
+		diff.Files = append(diff.Files, fileChange{
+			Path:             item.Path,
+			ChangeType:       ch.ChangeType,
+			ChangeTrackingID: ch.ChangeTrackingID,
+			Numbered:         numbered,
+			Lines:            lines,
+		})
 	}
 	if changes.NextTop > 0 {
 		diff.Omitted = append(diff.Omitted, fmt.Sprintf("changes beyond the first %d files", maxChangedFiles))
 	}
 	diff.Text = text.String()
 	return diff, nil
+}
+
+// numberedDiff renders a diff in which every line that exists in the new file
+// starts with its line number, so a model can cite lines without doing hunk
+// arithmetic. It also returns the set of line numbers shown.
+//
+//	12   unchanged line
+//	   - removed line
+//	13 + added line
+func numberedDiff(before, after string) (string, map[int]bool) {
+	a, b := splitLines(before), splitLines(after)
+	lines := make(map[int]bool)
+	var out strings.Builder
+	write := func(number int, marker string, line string) {
+		if number > 0 {
+			lines[number] = true
+			fmt.Fprintf(&out, "%5d %s %s", number, marker, line)
+		} else {
+			fmt.Fprintf(&out, "      %s %s", marker, line)
+		}
+		if !strings.HasSuffix(line, "\n") {
+			out.WriteByte('\n')
+		}
+	}
+	for i, group := range difflib.NewMatcher(a, b).GetGroupedOpCodes(5) {
+		if i > 0 {
+			out.WriteString("      ...\n")
+		}
+		for _, op := range group {
+			if op.Tag == 'e' {
+				for j := op.J1; j < op.J2; j++ {
+					write(j+1, " ", b[j])
+				}
+				continue
+			}
+			for k := op.I1; k < op.I2; k++ { // 'd' and the old side of 'r'
+				write(0, "-", a[k])
+			}
+			for j := op.J1; j < op.J2; j++ { // 'i' and the new side of 'r'
+				write(j+1, "+", b[j])
+			}
+		}
+	}
+	return out.String(), lines
+}
+
+// splitLines splits s after each newline. Unlike difflib.SplitLines it adds
+// no empty last line, which would throw the line numbers off by one.
+func splitLines(s string) []string {
+	lines := strings.SplitAfter(s, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 // blobText returns a blob's content. An empty id (the missing side of an add
@@ -218,15 +293,52 @@ func (c *azdoClient) UpdatePR(ctx context.Context, pr pullRequest, title, descri
 	return err
 }
 
-// PostComment adds a new active comment thread to the pull request.
-func (c *azdoClient) PostComment(ctx context.Context, pr pullRequest, markdown string) error {
+// threadStatus is an Azure DevOps comment thread status. Active threads count
+// against a "comments must be resolved" branch policy; closed ones don't.
+type threadStatus int
+
+const (
+	threadActive threadStatus = 1 // something for the author to resolve
+	threadClosed threadStatus = 4 // informational: already resolved
+)
+
+// PostComment adds a new comment thread to the pull request.
+func (c *azdoClient) PostComment(ctx context.Context, pr pullRequest, status threadStatus, markdown string) error {
+	return c.postThread(ctx, pr, status, markdown, nil)
+}
+
+// PostFileComment adds an active comment thread on a changed file. A line that is in
+// file.Lines anchors the thread to that line of the new file; any other line
+// number makes it a comment on the file as a whole.
+func (c *azdoClient) PostFileComment(ctx context.Context, pr pullRequest, iteration int, file fileChange, line int, markdown string) error {
+	threadContext := map[string]any{"filePath": file.Path}
+	if file.Lines[line] {
+		position := map[string]int{"line": line, "offset": 1}
+		threadContext["rightFileStart"], threadContext["rightFileEnd"] = position, position
+	}
+	return c.postThread(ctx, pr, threadActive, markdown, map[string]any{
+		"threadContext": threadContext,
+		"pullRequestThreadContext": map[string]any{
+			"changeTrackingId": file.ChangeTrackingID,
+			"iterationContext": map[string]int{
+				"firstComparingIteration":  iteration,
+				"secondComparingIteration": iteration,
+			},
+		},
+	})
+}
+
+func (c *azdoClient) postThread(ctx context.Context, pr pullRequest, status threadStatus, markdown string, extra map[string]any) error {
 	thread := map[string]any{
-		"status": 1, // active
+		"status": status,
 		"comments": []map[string]any{{
 			"parentCommentId": 0,
 			"commentType":     1, // text
 			"content":         markdown,
 		}},
+	}
+	for k, v := range extra {
+		thread[k] = v
 	}
 	_, err := c.do(ctx, http.MethodPost, c.repoURL(pr, fmt.Sprintf("pullRequests/%d/threads", pr.ID), nil),
 		"application/json", thread)

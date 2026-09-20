@@ -1,13 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"unicode/utf8"
 )
@@ -36,25 +32,8 @@ type enhancement struct {
 	Description string `json:"description"`
 }
 
-// openAIEnhancer calls any server that implements the OpenAI chat completions
-// API: llama.cpp, Ollama, vLLM, LM Studio, or a hosted service.
-type openAIEnhancer struct {
-	baseURL string // up to and including /v1
-	model   string // empty: use the first model the server lists
-	apiKey  string // empty: send no Authorization header
-	http    *http.Client
-}
-
-func newOpenAIEnhancer(baseURL, model, apiKey string) *openAIEnhancer {
-	return &openAIEnhancer{baseURL: strings.TrimRight(baseURL, "/"), model: model, apiKey: apiKey, http: &http.Client{}}
-}
-
-func (e *openAIEnhancer) Enhance(ctx context.Context, pr pullRequest, diff prDiff) (enhancement, error) {
-	model, err := e.resolveModel(ctx)
-	if err != nil {
-		return enhancement{}, err
-	}
-
+// Enhance asks the AI for a better title and description.
+func (c *openAIClient) Enhance(ctx context.Context, pr pullRequest, diff prDiff) (enhancement, error) {
 	var prompt strings.Builder
 	fmt.Fprintf(&prompt, "<pull_request>\nTitle: %s\nSource branch: %s\nTarget branch: %s\nDescription:\n%s\n</pull_request>\n\n",
 		pr.Title, pr.SourceRefName, pr.TargetRefName, pr.Description)
@@ -64,52 +43,16 @@ func (e *openAIEnhancer) Enhance(ctx context.Context, pr pullRequest, diff prDif
 			strings.Join(diff.Omitted, "\n- "))
 	}
 
-	// No max_tokens or temperature: reasoning models spend an unpredictable
-	// number of tokens thinking before they answer, and some hosted models
-	// reject one or both parameters. The request context bounds the call.
-	request := map[string]any{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "system", "content": enhanceSystemPrompt},
-			{"role": "user", "content": prompt.String()},
+	var result enhancement
+	err := c.chatJSON(ctx, enhanceSystemPrompt, prompt.String(), "pull_request", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"title":       map[string]string{"type": "string"},
+			"description": map[string]string{"type": "string"},
 		},
-		"response_format": map[string]any{
-			"type": "json_schema",
-			"json_schema": map[string]any{
-				"name":   "pull_request",
-				"strict": true,
-				"schema": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"title":       map[string]string{"type": "string"},
-						"description": map[string]string{"type": "string"},
-					},
-					"required":             []string{"title", "description"},
-					"additionalProperties": false,
-				},
-			},
-		},
-	}
-	var response struct {
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-			Message      struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := e.call(ctx, http.MethodPost, "/chat/completions", request, &response); err != nil {
-		return enhancement{}, err
-	}
-	if len(response.Choices) == 0 {
-		return enhancement{}, errors.New("AI server returned no choices")
-	}
-	choice := response.Choices[0]
-	if choice.FinishReason == "length" {
-		return enhancement{}, errors.New("AI server cut the answer off at its token limit")
-	}
-
-	result, err := parseEnhancement(choice.Message.Content)
+		"required":             []string{"title", "description"},
+		"additionalProperties": false,
+	}, &result)
 	if err != nil {
 		return enhancement{}, err
 	}
@@ -119,72 +62,6 @@ func (e *openAIEnhancer) Enhance(ctx context.Context, pr pullRequest, diff prDif
 		return enhancement{}, errors.New("AI server returned an empty title or description")
 	}
 	return result, nil
-}
-
-// parseEnhancement reads the JSON object out of a model reply. Servers that
-// ignore response_format tend to wrap the JSON in a code fence or a sentence,
-// so parse from the first brace to the last.
-func parseEnhancement(content string) (enhancement, error) {
-	start, end := strings.IndexByte(content, '{'), strings.LastIndexByte(content, '}')
-	if start < 0 || end < start {
-		return enhancement{}, fmt.Errorf("AI reply is not JSON: %.120q", content)
-	}
-	var result enhancement
-	if err := json.Unmarshal([]byte(content[start:end+1]), &result); err != nil {
-		return enhancement{}, fmt.Errorf("AI reply is not valid JSON: %w", err)
-	}
-	return result, nil
-}
-
-func (e *openAIEnhancer) resolveModel(ctx context.Context) (string, error) {
-	if e.model != "" {
-		return e.model, nil
-	}
-	var models struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := e.call(ctx, http.MethodGet, "/models", nil, &models); err != nil {
-		return "", err
-	}
-	if len(models.Data) == 0 {
-		return "", errors.New("AI server lists no models; set AI_MODEL")
-	}
-	return models.Data[0].ID, nil
-}
-
-func (e *openAIEnhancer) call(ctx context.Context, method, path string, body, out any) error {
-	var reqBody io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reqBody = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, e.baseURL+path, reqBody)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if e.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+e.apiKey)
-	}
-	resp, err := e.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("AI server: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("AI server: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("AI server: %s %s: %s: %.200s", method, path, resp.Status,
-			strings.Join(strings.Fields(string(data)), " "))
-	}
-	return json.Unmarshal(data, out)
 }
 
 // truncate shortens s to at most limit bytes without splitting a character.

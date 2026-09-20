@@ -25,7 +25,7 @@ func fakeAzdo(t *testing.T, posted *map[string]any) *httptest.Server {
 	})
 	mux.HandleFunc("GET "+repo+"/pullRequests/7/iterations/2/changes", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, `{"changeEntries":[
-			{"changeType":"edit","item":{"path":"/README.md","objectId":"new-readme","originalObjectId":"old-readme"}},
+			{"changeTrackingId":5,"changeType":"edit","item":{"path":"/README.md","objectId":"new-readme","originalObjectId":"old-readme"}},
 			{"changeType":"add","item":{"path":"/logo.png","objectId":"new-logo"}}]}`)
 	})
 	mux.HandleFunc("GET "+repo+"/blobs/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +77,12 @@ func TestDiff(t *testing.T) {
 			t.Errorf("diff missing %q:\n%s", want, diff.Text)
 		}
 	}
+	if diff.Iteration != 2 || len(diff.Files) != 1 {
+		t.Fatalf("Iteration = %d, Files = %+v, want iteration 2 and only the README", diff.Iteration, diff.Files)
+	}
+	if f := diff.Files[0]; f.Path != "/README.md" || f.ChangeTrackingID != 5 || !f.Lines[2] || !strings.Contains(f.Numbered, "    2 + Hello!") {
+		t.Errorf("Files[0] = %+v", f)
+	}
 	if len(diff.Omitted) != 1 || diff.Omitted[0] != "/logo.png (add, binary file)" {
 		t.Errorf("Omitted = %q, want the binary logo", diff.Omitted)
 	}
@@ -87,12 +93,15 @@ func TestPostComment(t *testing.T) {
 	srv := fakeAzdo(t, &posted)
 	defer srv.Close()
 
-	if err := newAzdoClient(srv.URL, "test-pat").PostComment(context.Background(), testPR(t), "**review**"); err != nil {
+	if err := newAzdoClient(srv.URL, "test-pat").PostComment(context.Background(), testPR(t), threadClosed, "**note**"); err != nil {
 		t.Fatal(err)
 	}
 	comments, _ := posted["comments"].([]any)
-	if len(comments) != 1 || comments[0].(map[string]any)["content"] != "**review**" {
+	if len(comments) != 1 || comments[0].(map[string]any)["content"] != "**note**" {
 		t.Errorf("posted thread = %v", posted)
+	}
+	if posted["status"] != float64(4) {
+		t.Errorf("status = %v, want 4 (closed)", posted["status"])
 	}
 }
 
@@ -106,6 +115,68 @@ func TestUpdatePR(t *testing.T) {
 	}
 	if sent["title"] != "New title" || sent["description"] != "New description" || len(sent) != 2 {
 		t.Errorf("PATCH body = %v, want only the new title and description", sent)
+	}
+}
+
+func TestPostFileComment(t *testing.T) {
+	file := fileChange{Path: "/README.md", ChangeTrackingID: 7, Lines: map[int]bool{2: true}}
+	tests := map[string]struct {
+		line     int
+		wantLine bool
+	}{
+		"line in the diff anchors the thread":     {2, true},
+		"unknown line comments on the whole file": {99, false},
+		"line 0 comments on the whole file":       {0, false},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			var posted map[string]any
+			srv := fakeAzdo(t, &posted)
+			defer srv.Close()
+
+			err := newAzdoClient(srv.URL, "test-pat").PostFileComment(context.Background(), testPR(t), 3, file, tc.line, "note")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if posted["status"] != float64(1) {
+				t.Errorf("status = %v, want 1 (active): a finding is for the author to resolve", posted["status"])
+			}
+			threadContext := posted["threadContext"].(map[string]any)
+			if threadContext["filePath"] != "/README.md" {
+				t.Errorf("filePath = %v", threadContext["filePath"])
+			}
+			start, hasLine := threadContext["rightFileStart"].(map[string]any)
+			if hasLine != tc.wantLine || (hasLine && start["line"] != float64(tc.line)) {
+				t.Errorf("rightFileStart = %v, want a line: %t", threadContext["rightFileStart"], tc.wantLine)
+			}
+			prContext := posted["pullRequestThreadContext"].(map[string]any)
+			iterations := prContext["iterationContext"].(map[string]any)
+			if prContext["changeTrackingId"] != float64(7) || iterations["secondComparingIteration"] != float64(3) {
+				t.Errorf("pullRequestThreadContext = %v", prContext)
+			}
+		})
+	}
+}
+
+func TestNumberedDiff(t *testing.T) {
+	before := "one\ntwo\nthree\n"
+	after := "one\n2\nthree\nfour" // no trailing newline
+	got, lines := numberedDiff(before, after)
+	want := "    1   one\n" +
+		"      - two\n" +
+		"    2 + 2\n" +
+		"    3   three\n" +
+		"    4 + four\n"
+	if got != want {
+		t.Errorf("numberedDiff =\n%s\nwant\n%s", got, want)
+	}
+	for line := 1; line <= 4; line++ {
+		if !lines[line] {
+			t.Errorf("line %d missing from the commentable set %v", line, lines)
+		}
+	}
+	if lines[0] || lines[5] {
+		t.Errorf("commentable set %v has lines that are not in the new file", lines)
 	}
 }
 

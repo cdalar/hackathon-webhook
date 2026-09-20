@@ -54,7 +54,12 @@ func (f *fakeAI) start(t *testing.T) *httptest.Server {
 }
 
 var testDiff = prDiff{
-	Text:    "# edit: /README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Demo\n+Hello!\n",
+	Iteration: 1,
+	Text:      "# edit: /README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Demo\n+Hello!\n",
+	Files: []fileChange{{
+		Path: "/README.md", ChangeType: "edit", ChangeTrackingID: 1,
+		Numbered: "    1   # Demo\n    2 + Hello!\n", Lines: map[int]bool{1: true, 2: true},
+	}},
 	Omitted: []string{"/logo.png (add, binary file)"},
 }
 
@@ -62,7 +67,7 @@ func TestEnhance(t *testing.T) {
 	ai := &fakeAI{reply: `{"title": "  Add greeting to README  ", "description": "Adds a greeting.\n"}`}
 	srv := ai.start(t)
 
-	got, err := newOpenAIEnhancer(srv.URL+"/v1/", "my-model", "k3y").Enhance(context.Background(), testPR(t), testDiff)
+	got, err := newOpenAIClient(srv.URL+"/v1/", "my-model", "k3y").Enhance(context.Background(), testPR(t), testDiff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +97,7 @@ func TestEnhanceDiscoversModelAndSkipsAuth(t *testing.T) {
 	ai := &fakeAI{reply: `{"title":"T","description":"D"}`}
 	srv := ai.start(t)
 
-	if _, err := newOpenAIEnhancer(srv.URL+"/v1", "", "").Enhance(context.Background(), testPR(t), testDiff); err != nil {
+	if _, err := newOpenAIClient(srv.URL+"/v1", "", "").Enhance(context.Background(), testPR(t), testDiff); err != nil {
 		t.Fatal(err)
 	}
 	if ai.lastModel != "local-model" {
@@ -107,7 +112,7 @@ func TestEnhanceToleratesWrappedJSON(t *testing.T) {
 	ai := &fakeAI{reply: "Here you go:\n```json\n{\"title\":\"T\",\"description\":\"uses {braces}\"}\n```"}
 	srv := ai.start(t)
 
-	got, err := newOpenAIEnhancer(srv.URL+"/v1", "m", "").Enhance(context.Background(), testPR(t), testDiff)
+	got, err := newOpenAIClient(srv.URL+"/v1", "m", "").Enhance(context.Background(), testPR(t), testDiff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +133,7 @@ func TestEnhanceErrors(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			srv := tc.ai.start(t)
-			_, err := newOpenAIEnhancer(srv.URL+"/v1", "m", "").Enhance(context.Background(), testPR(t), testDiff)
+			_, err := newOpenAIClient(srv.URL+"/v1", "m", "").Enhance(context.Background(), testPR(t), testDiff)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("err = %v, want one mentioning %q", err, tc.want)
 			}
@@ -159,7 +164,7 @@ func TestEnhanceLive(t *testing.T) {
 
 	pr := testPR(t)
 	pr.Title, pr.Description = "fix", "see AB#1234"
-	got, err := newOpenAIEnhancer(baseURL, os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY")).Enhance(ctx, pr, testDiff)
+	got, err := newOpenAIClient(baseURL, os.Getenv("AI_MODEL"), os.Getenv("AI_API_KEY")).Enhance(ctx, pr, testDiff)
 	if err != nil {
 		t.Fatal(err)
 	}

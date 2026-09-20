@@ -1,6 +1,7 @@
 // Command hackathon-webhook receives Azure DevOps pull request webhooks and, when
 // the AI Assistant group is on the reviewer list, asks an AI model to rewrite
-// the pull request's title and description from its changes.
+// the pull request's title and description from its changes and to comment on
+// the changed files.
 package main
 
 import (
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +28,7 @@ type config struct {
 	aiBaseURL     string
 	aiModel       string
 	aiAPIKey      string
+	review        bool
 }
 
 func loadConfig() (config, error) {
@@ -54,6 +57,11 @@ func loadConfig() (config, error) {
 	if len(missing) > 0 {
 		return cfg, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
+	review, err := strconv.ParseBool(envOr("REVIEW_COMMENTS", "true"))
+	if err != nil {
+		return cfg, fmt.Errorf("REVIEW_COMMENTS must be true or false, not %q", os.Getenv("REVIEW_COMMENTS"))
+	}
+	cfg.review = review
 	if cfg.mode != modeUpdate && cfg.mode != modeSuggest {
 		return cfg, fmt.Errorf("ENHANCE_MODE must be %q or %q, not %q", modeUpdate, modeSuggest, cfg.mode)
 	}
@@ -76,12 +84,16 @@ func main() {
 		log.Print("WARNING: WEBHOOK_SECRET is not set; anyone who can reach /webhook can trigger enhancements")
 	}
 
+	ai := newOpenAIClient(cfg.aiBaseURL, cfg.aiModel, cfg.aiAPIKey)
 	handler := &webhookHandler{
 		aiReviewerID: cfg.aiReviewerID,
 		secret:       cfg.webhookSecret,
 		mode:         cfg.mode,
 		prs:          newAzdoClient(cfg.orgURL, cfg.pat),
-		enhancer:     newOpenAIEnhancer(cfg.aiBaseURL, cfg.aiModel, cfg.aiAPIKey),
+		enhancer:     ai,
+	}
+	if cfg.review {
+		handler.reviewer = ai
 	}
 
 	mux := http.NewServeMux()
@@ -103,7 +115,8 @@ func main() {
 		}
 	}()
 
-	log.Printf("listening on %s (AI reviewer %s, AI server %s, %s mode)", cfg.addr, cfg.aiReviewerID, cfg.aiBaseURL, cfg.mode)
+	log.Printf("listening on %s (AI reviewer %s, AI server %s, %s mode, review comments %t)",
+		cfg.addr, cfg.aiReviewerID, cfg.aiBaseURL, cfg.mode, cfg.review)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

@@ -12,13 +12,13 @@ import (
 	"time"
 )
 
-// enhanceTimeout bounds one full run: fetching the diff, the AI call, and
-// writing the result back. Local models can take minutes on a large diff.
-const enhanceTimeout = 10 * time.Minute
+// runTimeout bounds one full run: fetching the diff, the AI calls, and
+// writing the results back. Local models can take minutes on a large diff.
+const runTimeout = 15 * time.Minute
 
 // enhancedFooter is appended to every description we write. It tells readers
-// where the text came from and marks the PR as done, so it is never
-// enhanced twice, even across restarts.
+// where the text came from and marks the description as done, so it is never
+// rewritten twice, even across restarts.
 const enhancedFooter = "_Title and description enhanced by AI Assistant from this pull request's changes._"
 
 const (
@@ -67,7 +67,8 @@ func (pr pullRequest) hasReviewer(id string) bool {
 // prClient is the Azure DevOps side of an enhancement.
 type prClient interface {
 	Diff(ctx context.Context, pr pullRequest) (prDiff, error)
-	PostComment(ctx context.Context, pr pullRequest, markdown string) error
+	PostComment(ctx context.Context, pr pullRequest, status threadStatus, markdown string) error
+	PostFileComment(ctx context.Context, pr pullRequest, iteration int, file fileChange, line int, markdown string) error
 	UpdatePR(ctx context.Context, pr pullRequest, title, description string) error
 }
 
@@ -76,12 +77,18 @@ type enhancer interface {
 	Enhance(ctx context.Context, pr pullRequest, diff prDiff) (enhancement, error)
 }
 
+// reviewer turns a pull request's changed files into review comments.
+type reviewer interface {
+	Review(ctx context.Context, pr pullRequest, diff prDiff) ([]reviewComment, error)
+}
+
 type webhookHandler struct {
 	aiReviewerID string
 	secret       string
 	mode         string
 	prs          prClient
 	enhancer     enhancer
+	reviewer     reviewer // nil: don't comment on the changed files
 
 	mu   sync.Mutex
 	seen map[string]bool
@@ -114,7 +121,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case !pr.hasReviewer(h.aiReviewerID):
 		fmt.Fprintln(w, "ignored: AI reviewer is not on the pull request")
 		return
-	case strings.Contains(pr.Description, enhancedFooter):
+	case h.reviewer == nil && strings.Contains(pr.Description, enhancedFooter):
 		fmt.Fprintln(w, "ignored: pull request is already enhanced")
 		return
 	}
@@ -127,48 +134,68 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The AI call takes far longer than the service hook's delivery timeout,
+	// The AI calls take far longer than the service hook's delivery timeout,
 	// so acknowledge now and do the work in the background.
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), enhanceTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 		defer cancel()
-		if err := h.enhance(ctx, pr); err != nil {
-			log.Printf("PR %d: enhancement failed: %v", pr.ID, err)
+		if err := h.run(ctx, pr); err != nil {
+			log.Printf("PR %d: failed: %v", pr.ID, err)
 			h.forget(key) // let a later delivery retry
-			return
 		}
-		log.Printf("PR %d: enhanced (%s mode)", pr.ID, h.mode)
 	}()
 
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintln(w, "enhancement started")
 }
 
-func (h *webhookHandler) enhance(ctx context.Context, pr pullRequest) error {
+// run enhances the PR's title and description, unless that was done before,
+// and then comments on the changed files.
+func (h *webhookHandler) run(ctx context.Context, pr pullRequest) error {
 	diff, err := h.prs.Diff(ctx, pr)
 	if err != nil {
 		return fmt.Errorf("fetching diff: %w", err)
 	}
 	if diff.Text == "" {
-		return h.prs.PostComment(ctx, pr, "**🤖 AI Assistant:** this pull request has no text changes to describe, so I left its title and description as they are.")
+		return h.prs.PostComment(ctx, pr, threadClosed, "**🤖 AI Assistant:** this pull request has no text changes for me to read, so I left it as it is."+omittedNote(diff))
 	}
+	if !strings.Contains(pr.Description, enhancedFooter) {
+		if err := h.enhance(ctx, pr, diff); err != nil {
+			return err
+		}
+		log.Printf("PR %d: enhanced (%s mode)", pr.ID, h.mode)
+	}
+	if h.reviewer != nil {
+		posted, err := h.review(ctx, pr, diff)
+		if err != nil {
+			return err
+		}
+		log.Printf("PR %d: reviewed, %d comments", pr.ID, posted)
+	}
+	return nil
+}
+
+func (h *webhookHandler) enhance(ctx context.Context, pr pullRequest, diff prDiff) error {
 	result, err := h.enhancer.Enhance(ctx, pr, diff)
 	if err != nil {
 		return fmt.Errorf("asking the AI: %w", err)
 	}
 
 	if h.mode == modeSuggest {
-		if err := h.prs.PostComment(ctx, pr, suggestionComment(result, diff)); err != nil {
+		// Active on purpose: the suggestion is for the author to act on, and a
+		// closed thread is collapsed out of sight.
+		if err := h.prs.PostComment(ctx, pr, threadActive, suggestionComment(result, diff)); err != nil {
 			return fmt.Errorf("posting suggestion: %w", err)
 		}
 		return nil
 	}
 
 	// Save the author's text before overwriting it: Azure DevOps keeps no
-	// history of a pull request's description.
-	if err := h.prs.PostComment(ctx, pr, originalsComment(pr, diff)); err != nil {
+	// history of a pull request's description. The thread is a record, not a
+	// request, so it is born closed and can't hold up the PR.
+	if err := h.prs.PostComment(ctx, pr, threadClosed, originalsComment(pr, diff)); err != nil {
 		return fmt.Errorf("saving original description: %w", err)
 	}
 	description := truncate(result.Description, maxDescriptionLen-len(enhancedFooter)-len("\n\n---\n")) +
@@ -177,6 +204,37 @@ func (h *webhookHandler) enhance(ctx context.Context, pr pullRequest) error {
 		return fmt.Errorf("updating pull request: %w", err)
 	}
 	return nil
+}
+
+// review posts the AI's comments on the changed files and returns how many.
+func (h *webhookHandler) review(ctx context.Context, pr pullRequest, diff prDiff) (int, error) {
+	comments, err := h.reviewer.Review(ctx, pr, diff)
+	if err != nil {
+		return 0, fmt.Errorf("asking the AI for a review: %w", err)
+	}
+	if len(comments) == 0 {
+		err := h.prs.PostComment(ctx, pr, threadClosed, fmt.Sprintf("**🤖 AI Assistant** reviewed the changes in %d file(s) and has no comments.%s",
+			len(diff.Files), omittedNote(diff)))
+		return 0, err
+	}
+
+	files := make(map[string]fileChange, len(diff.Files))
+	for _, f := range diff.Files {
+		files[strings.TrimPrefix(f.Path, "/")] = f
+	}
+	for i, c := range comments {
+		markdown := "**🤖 AI Assistant:** " + c.Comment
+		if file, ok := files[strings.TrimPrefix(c.File, "/")]; ok {
+			// A line the model got wrong becomes a comment on the whole file.
+			err = h.prs.PostFileComment(ctx, pr, diff.Iteration, file, c.Line, markdown)
+		} else {
+			err = h.prs.PostComment(ctx, pr, threadActive, fmt.Sprintf("**🤖 AI Assistant** on `%s`: %s", c.File, c.Comment))
+		}
+		if err != nil {
+			return i, fmt.Errorf("posting review comment: %w", err)
+		}
+	}
+	return len(comments), nil
 }
 
 func suggestionComment(result enhancement, diff prDiff) string {
