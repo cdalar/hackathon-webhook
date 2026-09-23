@@ -192,8 +192,10 @@ docker run -d --name hackathon-webhook -p 8080:8080 \
   ghcr.io/cdalar/hackathon-webhook:latest
 ```
 
-For deployments, pin a `sha-<commit>` or version tag rather than `latest`. To
-build locally instead: `docker build -t hackathon-webhook .`
+The same tags are also on Docker Hub as `cdalar/hackathon-webhook`, if you'd
+rather pull from there. For deployments, pin a `sha-<commit>` or version tag
+rather than `latest`. To build locally instead:
+`docker build -t hackathon-webhook .`
 
 `-e NAME` with no value passes the variable through from your shell, which keeps
 secrets out of the command line and shell history. Or copy `.env.example` to
