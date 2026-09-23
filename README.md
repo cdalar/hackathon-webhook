@@ -181,8 +181,9 @@ HTTPS — deploy it behind TLS, or use a tunnel while developing.
 ## Docker
 
 Every push to `main` publishes a multi-arch (amd64 + arm64) image to the GitHub
-Container Registry, tagged `latest` and `sha-<commit>`; `v*` git tags also
-publish `<version>` and `<major>.<minor>`.
+Container Registry and to Docker Hub (`cdalar/hackathon-webhook`), tagged
+`latest` and `sha-<commit>`; `v*` git tags also publish `<version>` and
+`<major>.<minor>`.
 
 ```sh
 docker run -d --name hackathon-webhook -p 8080:8080 \
