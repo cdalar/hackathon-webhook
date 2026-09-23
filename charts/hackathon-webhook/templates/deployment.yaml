@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hackathon-webhook.fullname" . }}
+  labels:
+    {{- include "hackathon-webhook.labels" . | nindent 4 }}
+spec:
+  # One replica: the receiver remembers which PRs it is already working on in
+  # memory, so a second one could handle the same event twice.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "hackathon-webhook.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if not .Values.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "hackathon-webhook.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hackathon-webhook
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: AZDO_ORG_URL
+              value: {{ required "azdo.orgURL is required" .Values.azdo.orgURL | quote }}
+            - name: AI_REVIEWER_ID
+              value: {{ required "azdo.reviewerID is required" .Values.azdo.reviewerID | quote }}
+            - name: AI_BASE_URL
+              value: {{ required "ai.baseURL is required" .Values.ai.baseURL | quote }}
+            {{- with .Values.ai.model }}
+            - name: AI_MODEL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if ne (toString .Values.ai.thinkingBudget) "" }}
+            - name: AI_THINKING_BUDGET
+              value: {{ .Values.ai.thinkingBudget | quote }}
+            {{- end }}
+            {{- with .Values.ai.extraBody }}
+            - name: AI_EXTRA_BODY
+              value: {{ . | quote }}
+            {{- end }}
+            - name: ENHANCE_MODE
+              value: {{ .Values.enhanceMode | quote }}
+            - name: REVIEW_COMMENTS
+              value: {{ .Values.reviewComments | quote }}
+            - name: REVIEW_SUGGESTIONS
+              value: {{ .Values.reviewSuggestions | quote }}
+            {{- range $key := list "AZDO_PAT" "WEBHOOK_SECRET" "AI_API_KEY" }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hackathon-webhook.secretName" $ }}
+                  key: {{ $key }}
+                  optional: {{ ne $key "AZDO_PAT" }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

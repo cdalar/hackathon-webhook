@@ -1,0 +1,61 @@
+image:
+  repository: docker.io/cdalar/hackathon-webhook
+  # Defaults to the chart's appVersion. Pin a sha-<commit> or version tag for
+  # deployments.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Required settings. See the README's Configuration section.
+azdo:
+  orgURL: ""       # e.g. https://dev.azure.com/my-org
+  reviewerID: ""   # identity ID (GUID) of the AI Assistant reviewer group
+ai:
+  baseURL: ""      # OpenAI-compatible API including /v1, e.g. http://llm.ai.svc:8080/v1
+  model: ""
+  thinkingBudget: ""  # tokens; "0" turns thinking off, empty means no cap
+  extraBody: ""       # JSON object merged into every chat request
+
+enhanceMode: update        # update or suggest
+reviewComments: true
+reviewSuggestions: false
+
+# AZDO_PAT, WEBHOOK_SECRET and AI_API_KEY come from a Secret. Either name an
+# existing one holding those keys, or set the values below and the chart
+# creates it.
+existingSecret: ""
+secrets:
+  azdoPAT: ""
+  webhookSecret: ""
+  aiAPIKey: ""
+
+# Extra environment variables for the container.
+extraEnv: []
+
+service:
+  type: ClusterIP
+  port: 80
+
+# Azure DevOps must reach /webhook over HTTPS.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls: []
+  #  - secretName: hackathon-webhook-tls
+  #    hosts: [webhook.example.com]
+
+# The receiver waits for in-flight AI calls (up to 15 minutes each) before it
+# exits, so give it that long to shut down.
+terminationGracePeriodSeconds: 960
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}

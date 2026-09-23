@@ -1,0 +1,12 @@
+Point the Azure DevOps service hook at:
+
+{{- if .Values.ingress.enabled }}
+  https://{{ .Values.ingress.host }}/webhook
+{{- else }}
+  http://{{ include "hackathon-webhook.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/webhook
+  (in-cluster only; Azure DevOps needs HTTPS, so enable the ingress or expose it another way)
+{{- end }}
+{{- if and (not .Values.existingSecret) (not .Values.secrets.webhookSecret) }}
+
+WARNING: secrets.webhookSecret is not set; anyone who can reach /webhook can trigger enhancements.
+{{- end }}

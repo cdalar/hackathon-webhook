@@ -1,0 +1,13 @@
+apiVersion: v2
+# Not "hackathon-webhook": an OCI registry stores a chart in a repository named
+# after it, and on Docker Hub that one already holds the container image.
+name: hackathon-webhook-chart
+description: Azure DevOps webhook that rewrites pull request titles and descriptions and reviews the changes with an AI model
+type: application
+version: 0.1.0
+# The image tag used when image.tag is empty. CI sets both this and version to
+# the git tag when it publishes the chart.
+appVersion: latest
+home: https://github.com/cdalar/hackathon-webhook
+sources:
+  - https://github.com/cdalar/hackathon-webhook

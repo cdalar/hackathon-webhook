@@ -207,6 +207,33 @@ load balancer, Caddy, a tunnel). Use `/healthz` for health checks. On `SIGTERM`
 it stops accepting deliveries and waits for in-flight enhancements to finish, so give
 it a generous stop timeout (`docker stop -t 600`).
 
+## Kubernetes
+
+A Helm chart lives in `charts/hackathon-webhook` and runs the Docker Hub image.
+Each `v*` git tag also publishes it to Docker Hub as
+`oci://registry-1.docker.io/cdalar/hackathon-webhook-chart`, with the chart
+version equal to the image version.
+
+```sh
+kubectl create secret generic hackathon-webhook \
+  --from-literal=AZDO_PAT="$AZDO_PAT" \
+  --from-literal=WEBHOOK_SECRET="$WEBHOOK_SECRET"
+
+helm install hackathon-webhook oci://registry-1.docker.io/cdalar/hackathon-webhook-chart \
+  --version <version> \
+  --set existingSecret=hackathon-webhook \
+  --set azdo.orgURL=https://dev.azure.com/my-org \
+  --set azdo.reviewerID=<group-guid> \
+  --set ai.baseURL=http://my-llm-host:8080/v1 \
+  --set ingress.enabled=true,ingress.host=webhook.example.com
+```
+
+Or install from a checkout with `helm install hackathon-webhook
+charts/hackathon-webhook ...`, which runs the `latest` image unless you set
+`image.tag`. See `charts/hackathon-webhook/values.yaml` for every setting. The
+chart runs a single replica, because the receiver tracks work in progress in
+memory, and gives the pod 16 minutes to finish in-flight AI calls on shutdown.
+
 ## Try it without a service hook
 
 `scripts/emulate-delivery.sh` fetches a pull request's current state and POSTs
