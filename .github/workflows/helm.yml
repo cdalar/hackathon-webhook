@@ -14,7 +14,7 @@ on:
 jobs:
   run:
     name: Helm
-    runs-on: ubuntu-latest
+    runs-on: onctl-2
     timeout-minutes: 5
 
     steps:
@@ -35,7 +35,7 @@ jobs:
     # Only for release tags, so a chart version always matches an image tag.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: run
-    runs-on: ubuntu-latest
+    runs-on: onctl-2
     timeout-minutes: 5
 
     steps:
