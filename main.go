@@ -99,6 +99,36 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
+// logRequests logs every request but health checks, which a Kubernetes probe
+// sends every few seconds.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		started := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		from := r.RemoteAddr
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			from += " (for " + fwd + ")"
+		}
+		log.Printf("%s %s from %s: %d in %s (%q)", r.Method, r.URL.Path, from, rec.status,
+			time.Since(started).Round(time.Microsecond), r.UserAgent())
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -129,7 +159,7 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
-	srv := &http.Server{Addr: cfg.addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: cfg.addr, Handler: logRequests(mux), ReadHeaderTimeout: 10 * time.Second}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

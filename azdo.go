@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"github.com/pmezard/go-difflib/difflib"
@@ -101,11 +103,14 @@ func (c *azdoClient) do(ctx context.Context, method, url, accept string, body an
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	started := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	log.Printf("Azure DevOps: %s %s: %s in %s", method, req.URL.Path, resp.Status,
+		time.Since(started).Round(time.Millisecond))
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err

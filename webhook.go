@@ -97,6 +97,7 @@ type webhookHandler struct {
 
 func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.authorized(r) {
+		log.Print("webhook: rejected: wrong or missing WEBHOOK_SECRET")
 		w.Header().Set("WWW-Authenticate", `Basic realm="webhook"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -104,6 +105,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var ev event
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&ev); err != nil {
+		log.Printf("webhook: rejected: invalid JSON payload: %v", err)
 		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
 		return
 	}
@@ -111,18 +113,26 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Anything we don't act on still gets a 200: Azure DevOps disables a
 	// subscription after repeated non-2xx responses.
-	switch {
-	case ev.EventType != "git.pullrequest.created" && ev.EventType != "git.pullrequest.updated":
+	if ev.EventType != "git.pullrequest.created" && ev.EventType != "git.pullrequest.updated" {
+		log.Printf("webhook: ignored: event type %q", ev.EventType)
 		fmt.Fprintf(w, "ignored: event type %q\n", ev.EventType)
 		return
+	}
+	log.Printf("PR %d: %s event, repository %s, %s, commit %.7s, %d reviewer(s)", pr.ID, ev.EventType,
+		pr.Repository.Name, pr.Status, pr.LastMergeSourceCommit.CommitID, len(pr.Reviewers))
+	ignore := func(reason string) {
+		log.Printf("PR %d: ignored: %s", pr.ID, reason)
+		fmt.Fprintf(w, "ignored: %s\n", reason)
+	}
+	switch {
 	case pr.Status != "active":
-		fmt.Fprintf(w, "ignored: pull request is %s\n", pr.Status)
+		ignore("pull request is " + pr.Status)
 		return
 	case !pr.hasReviewer(h.aiReviewerID):
-		fmt.Fprintln(w, "ignored: AI reviewer is not on the pull request")
+		ignore("AI reviewer is not on the pull request")
 		return
 	case h.reviewer == nil && strings.Contains(pr.Description, enhancedFooter):
-		fmt.Fprintln(w, "ignored: pull request is already enhanced")
+		ignore("pull request is already enhanced")
 		return
 	}
 
@@ -130,9 +140,10 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reviewer is on it, so handle each source commit of a PR only once.
 	key := fmt.Sprintf("%s/%d@%s", pr.Repository.ID, pr.ID, pr.LastMergeSourceCommit.CommitID)
 	if !h.markSeen(key) {
-		fmt.Fprintln(w, "ignored: already handled this commit")
+		ignore("already handled this commit")
 		return
 	}
+	log.Printf("PR %d: started", pr.ID)
 
 	// The AI calls take far longer than the service hook's delivery timeout,
 	// so acknowledge now and do the work in the background.
@@ -141,10 +152,13 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer h.wg.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 		defer cancel()
+		started := time.Now()
 		if err := h.run(ctx, pr); err != nil {
-			log.Printf("PR %d: failed: %v", pr.ID, err)
+			log.Printf("PR %d: failed: %v (after %s)", pr.ID, err, time.Since(started).Round(time.Second))
 			h.forget(key) // let a later delivery retry
+			return
 		}
+		log.Printf("PR %d: done in %s", pr.ID, time.Since(started).Round(time.Second))
 	}()
 
 	w.WriteHeader(http.StatusAccepted)
@@ -158,7 +172,10 @@ func (h *webhookHandler) run(ctx context.Context, pr pullRequest) error {
 	if err != nil {
 		return fmt.Errorf("fetching diff: %w", err)
 	}
+	log.Printf("PR %d: diff of iteration %d: %d file(s), %d KB, %d left out", pr.ID, diff.Iteration,
+		len(diff.Files), len(diff.Text)/1024, len(diff.Omitted))
 	if diff.Text == "" {
+		log.Printf("PR %d: no text changes; commenting and stopping", pr.ID)
 		return h.prs.PostComment(ctx, pr, threadClosed, "**🤖 AI Assistant:** this pull request has no text changes for me to read, so I left it as it is."+omittedNote(diff))
 	}
 	if !strings.Contains(pr.Description, enhancedFooter) {
@@ -166,6 +183,8 @@ func (h *webhookHandler) run(ctx context.Context, pr pullRequest) error {
 			return err
 		}
 		log.Printf("PR %d: enhanced (%s mode)", pr.ID, h.mode)
+	} else {
+		log.Printf("PR %d: title and description already enhanced; skipping to the review", pr.ID)
 	}
 	if h.reviewer != nil {
 		posted, err := h.review(ctx, pr, diff)
@@ -189,6 +208,7 @@ func (h *webhookHandler) enhance(ctx context.Context, pr pullRequest, diff prDif
 		if err := h.prs.PostComment(ctx, pr, threadActive, suggestionComment(result, diff)); err != nil {
 			return fmt.Errorf("posting suggestion: %w", err)
 		}
+		log.Printf("PR %d: posted suggested title %q", pr.ID, result.Title)
 		return nil
 	}
 
@@ -198,11 +218,13 @@ func (h *webhookHandler) enhance(ctx context.Context, pr pullRequest, diff prDif
 	if err := h.prs.PostComment(ctx, pr, threadClosed, originalsComment(pr, diff)); err != nil {
 		return fmt.Errorf("saving original description: %w", err)
 	}
+	log.Printf("PR %d: saved the original title and description in a comment", pr.ID)
 	description := truncate(result.Description, maxDescriptionLen-len(enhancedFooter)-len("\n\n---\n")) +
 		"\n\n---\n" + enhancedFooter
 	if err := h.prs.UpdatePR(ctx, pr, result.Title, description); err != nil {
 		return fmt.Errorf("updating pull request: %w", err)
 	}
+	log.Printf("PR %d: title %q -> %q, description rewritten", pr.ID, pr.Title, result.Title)
 	return nil
 }
 
@@ -213,6 +235,7 @@ func (h *webhookHandler) review(ctx context.Context, pr pullRequest, diff prDiff
 		return 0, fmt.Errorf("asking the AI for a review: %w", err)
 	}
 	if len(comments) == 0 {
+		log.Printf("PR %d: review found nothing to comment on", pr.ID)
 		err := h.prs.PostComment(ctx, pr, threadClosed, fmt.Sprintf("**🤖 AI Assistant** reviewed the changes in %d file(s) and has no comments.%s",
 			len(diff.Files), omittedNote(diff)))
 		return 0, err
@@ -223,6 +246,7 @@ func (h *webhookHandler) review(ctx context.Context, pr pullRequest, diff prDiff
 		files[strings.TrimPrefix(f.Path, "/")] = f
 	}
 	for i, c := range comments {
+		var where string
 		markdown := "**🤖 AI Assistant:** " + c.Comment
 		if file, ok := files[strings.TrimPrefix(c.File, "/")]; ok {
 			// A line the model got wrong becomes a comment on the whole file.
@@ -232,13 +256,19 @@ func (h *webhookHandler) review(ctx context.Context, pr pullRequest, diff prDiff
 			} else {
 				lastLine = c.Line // without a suggestion, point at the one line
 			}
+			where = fmt.Sprintf("%s lines %d-%d", file.Path, c.Line, lastLine)
+			if strings.Contains(markdown, "```suggestion") {
+				where += ", with a suggested change"
+			}
 			err = h.prs.PostFileComment(ctx, pr, diff.Iteration, file, c.Line, lastLine, markdown)
 		} else {
+			where = c.File + ", which is not in the diff, so on the PR itself"
 			err = h.prs.PostComment(ctx, pr, threadActive, fmt.Sprintf("**🤖 AI Assistant** on `%s`: %s", c.File, c.Comment))
 		}
 		if err != nil {
 			return i, fmt.Errorf("posting review comment: %w", err)
 		}
+		log.Printf("PR %d: posted comment %d/%d on %s", pr.ID, i+1, len(comments), where)
 	}
 	return len(comments), nil
 }
